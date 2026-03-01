@@ -1188,12 +1188,12 @@ class EnhancedUI(tk.Tk):
         )
 
     def _display_status(self, account):
+        if account.get("disabled"):
+            return "已关闭"
         if account.get("invalid_401"):
             return "401失效"
         if account.get("invalid_quota"):
             return "无额度"
-        if account.get("disabled"):
-            return "已关闭"
         s = account.get("status") or "unknown"
         if s == "active":
             return "活跃"
@@ -1274,7 +1274,7 @@ class EnhancedUI(tk.Tk):
                 continue
             if status_filter == "401失效" and not account.get("invalid_401"):
                 continue
-            if status_filter == "无额度" and not account.get("invalid_quota"):
+            if status_filter == "无额度" and (not account.get("invalid_quota") or account.get("disabled")):
                 continue
 
             if text_filter:
@@ -1980,17 +1980,29 @@ class EnhancedUI(tk.Tk):
         if not messagebox.askyesno(
             "确认恢复",
             (
-                f"将检测 {len(candidates)} 个已关闭账号的额度。\n"
-                "仅当不满足“无额度”条件时，才会自动开启这些账号。\n\n"
+                f"将检测 {len(candidates)} 个已关闭账号的额度与状态（含401/其他错误）。\n"
+                "仅当状态正常且不满足“无额度”条件时，才会自动开启这些账号。\n\n"
                 "继续吗？"
             ),
         ):
             return
 
-        self.action_progress.set(f"正在检测已关闭账号额度... 候选={len(candidates)}")
+        self.action_progress.set(f"正在检测已关闭账号额度与状态... 候选={len(candidates)}")
 
         def worker():
             try:
+                probe_results = asyncio.run(
+                    probe_accounts(
+                        rt["base_url"],
+                        rt["token"],
+                        candidates,
+                        rt["user_agent"],
+                        rt["chatgpt_account_id"],
+                        rt["workers"],
+                        rt["timeout"],
+                        rt["retries"],
+                    )
+                )
                 quota_results = asyncio.run(
                     check_quota_accounts(
                         rt["base_url"],
@@ -2006,12 +2018,19 @@ class EnhancedUI(tk.Tk):
                     )
                 )
 
-                recoverable = [
-                    r
-                    for r in quota_results
-                    if r.get("status_code") == 200
-                    and not r.get("invalid_quota")
-                ]
+                probe_by_name = {r.get("name"): r for r in probe_results if r.get("name")}
+                recoverable = []
+                for q in quota_results:
+                    name = q.get("name")
+                    p = probe_by_name.get(name)
+                    if not p:
+                        continue
+                    if p.get("status_code") != 200 or p.get("invalid_401") or p.get("error"):
+                        continue
+                    if q.get("status_code") != 200 or q.get("invalid_quota") or q.get("error"):
+                        continue
+                    recoverable.append(q)
+
                 names_to_enable = [r.get("name") for r in recoverable if r.get("name")]
 
                 enable_results = []
@@ -2026,26 +2045,41 @@ class EnhancedUI(tk.Tk):
                         )
                     )
 
-                self.after(0, self._recover_closed_done, quota_results, enable_results)
+                self.after(0, self._recover_closed_done, probe_results, quota_results, enable_results)
             except Exception as e:
                 self.after(0, messagebox.showerror, "恢复失败", str(e))
                 self.after(0, self.action_progress.set, "恢复失败")
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _recover_closed_done(self, quota_results, enable_results):
+    def _recover_closed_done(self, probe_results, quota_results, enable_results):
+        probe_by_name = {r.get("name"): r for r in probe_results if r.get("name")}
         quota_by_name = {r.get("name"): r for r in quota_results if r.get("name")}
         enable_by_name = {r.get("name"): r for r in enable_results if r.get("name")}
 
-        checked = len(quota_results)
+        checked = max(len(probe_results), len(quota_results))
         recoverable = 0
         enabled_ok = 0
         enabled_fail = 0
-        quota_errors = 0
+        detect_errors = 0
+        invalid_401_count = 0
+        other_status_count = 0
 
         for account in self.all_accounts:
             name = account.get("name")
+            p = probe_by_name.get(name)
             q = quota_by_name.get(name)
+
+            if p:
+                account["invalid_401"] = bool(p.get("invalid_401"))
+                p_status = p.get("status_code")
+                if account["invalid_401"]:
+                    invalid_401_count += 1
+                elif p_status is not None and p_status != 200:
+                    other_status_count += 1
+                if p.get("error"):
+                    detect_errors += 1
+
             if q:
                 account["invalid_quota"] = bool(q.get("invalid_quota"))
                 account["used_percent"] = q.get("used_percent")
@@ -2055,11 +2089,28 @@ class EnhancedUI(tk.Tk):
                 account["individual_reset_at"] = q.get("individual_reset_at")
                 account["quota_source"] = q.get("quota_source")
                 account["reset_at"] = q.get("reset_at")
-                account["check_error"] = q.get("error")
                 if q.get("error"):
-                    quota_errors += 1
-                if q.get("status_code") == 200 and not q.get("invalid_quota"):
+                    detect_errors += 1
+
+                p_ok = bool(
+                    p
+                    and p.get("status_code") == 200
+                    and not p.get("invalid_401")
+                    and not p.get("error")
+                )
+                if p_ok and q.get("status_code") == 200 and not q.get("invalid_quota") and not q.get("error"):
                     recoverable += 1
+
+            if q and q.get("error"):
+                account["check_error"] = q.get("error")
+            elif p and p.get("error"):
+                account["check_error"] = p.get("error")
+            elif p and p.get("status_code") not in (None, 200):
+                account["check_error"] = f"api status_code={p.get('status_code')}"
+            elif q and q.get("status_code") not in (None, 200):
+                account["check_error"] = f"quota status_code={q.get('status_code')}"
+            elif p or q:
+                account["check_error"] = None
 
             e = enable_by_name.get(name)
             if e:
@@ -2079,10 +2130,12 @@ class EnhancedUI(tk.Tk):
             "恢复已关闭结果",
             (
                 f"已关闭检测: {checked}\n"
-                f"额度恢复(可开启): {recoverable}\n"
+                f"状态正常且额度恢复(可开启): {recoverable}\n"
+                f"401失效: {invalid_401_count}\n"
+                f"其他状态异常: {other_status_count}\n"
                 f"开启成功: {enabled_ok}\n"
                 f"开启失败: {enabled_fail}\n"
-                f"检测异常: {quota_errors}"
+                f"检测异常: {detect_errors}"
             ),
         )
 
