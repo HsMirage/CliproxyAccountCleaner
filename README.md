@@ -40,7 +40,7 @@
 ### 方式 B：源码运行
 
 ```bash
-python enhanced_ui.py
+python CliproxyAccountCleaner.py
 ```
 
 ## 常见操作流程
