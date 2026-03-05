@@ -896,7 +896,7 @@ class EnhancedUI(tk.Tk):
         ttk.Entry(cfg_top_row, textvariable=self.base_url_var).grid(row=0, column=1, sticky="ew", padx=(8, 18))
 
         ttk.Label(cfg_top_row, text="访问令牌 (token / cpa_password)").grid(row=0, column=2, sticky="w")
-        ttk.Entry(cfg_top_row, textvariable=self.token_var, show="*").grid(row=0, column=3, sticky="ew", padx=(8, 0))
+        ttk.Entry(cfg_top_row, textvariable=self.token_var).grid(row=0, column=3, sticky="ew", padx=(8, 0))
 
         params_row = ttk.Frame(cfg)
         params_row.pack(fill="x")
