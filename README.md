@@ -88,8 +88,10 @@
 ### 方式 B：源码运行
 
 ```bash
-python CliproxyAccountCleaner.py
+uv run .\CliproxyAccountCleaner.py
 ```
+
+首次运行时，`uv` 会根据项目根目录的 `pyproject.toml` 自动创建虚拟环境并安装依赖。
 
 ## 常见操作流程
 

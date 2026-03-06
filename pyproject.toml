@@ -1,0 +1,17 @@
+[project]
+name = "cliproxy-account-cleaner"
+version = "1.3.3"
+description = "CLIProxy 管理端批量账号检测与处理工具"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "aiohttp>=3.9,<4",
+  "requests>=2.31,<3",
+]
+
+[tool.uv]
+package = false
+
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"

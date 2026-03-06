@@ -1,0 +1,5 @@
+.venv/
+.spec-workflow/
+__pycache__/
+*.pyc
+config.json
