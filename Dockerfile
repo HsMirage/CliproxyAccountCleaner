@@ -11,6 +11,6 @@ COPY config.example.json /app/config.json
 
 RUN pip install --no-cache-dir requests aiohttp
 
-EXPOSE ${PORT:-8765}
+EXPOSE 8765
 
-CMD ["sh", "-c", "[ -f /etc/secrets/config.json ] && cp /etc/secrets/config.json /app/config.json; python CliproxyAccountCleaner.py --host 0.0.0.0 --port ${PORT:-8765} --no-browser"]
+CMD ["sh", "-c", "if [ -f /etc/secrets/config.json ]; then cp /etc/secrets/config.json /app/config.json; fi; exec python CliproxyAccountCleaner.py --host 0.0.0.0 --port ${PORT:-8765} --no-browser"]

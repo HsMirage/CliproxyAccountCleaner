@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import asyncio
 import hmac
@@ -145,6 +145,7 @@ class WebState:
     async def _set_disabled_with_progress(self, base_url, token, names, disabled, workers, timeout, track=False):
         aiohttp = self.ns["aiohttp"]
         mgmt_headers = self.ns["mgmt_headers"]
+        management_action_succeeded = self.ns["management_action_succeeded"]
         safe_json_text = self.ns["safe_json_text"]
 
         async def set_one(session, sem, name):
@@ -160,7 +161,7 @@ class WebState:
                     ) as resp:
                         text = await resp.text()
                         data = safe_json_text(text)
-                        ok = 200 <= resp.status < 300
+                        ok = management_action_succeeded(resp.status, data)
                         return {"name": name, "updated": ok, "disabled": bool(disabled), "status": resp.status, "error": None if ok else text[:200]}
             except Exception as e:
                 return {"name": name, "updated": False, "disabled": bool(disabled), "status": None, "error": str(e)}
