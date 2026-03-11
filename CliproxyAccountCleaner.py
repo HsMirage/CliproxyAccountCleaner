@@ -140,6 +140,15 @@ def as_json_obj(value):
     return {}
 
 
+def management_action_succeeded(status_code, payload, allow_no_content=False):
+    """Treat management mutations as successful only for explicit success responses."""
+    if allow_no_content and status_code == 204:
+        return True
+    if status_code != 200:
+        return False
+    return as_json_obj(payload).get("status") == "ok"
+
+
 def write_json_file(path, data):
     p = Path(str(path))
     if p.parent and str(p.parent) not in ("", "."):
@@ -711,7 +720,7 @@ async def set_disabled_names(base_url, token, names, disabled, workers, timeout)
                 ) as resp:
                     text = await resp.text()
                     data = safe_json_text(text)
-                    ok = resp.status == 200 and data.get("status") == "ok"
+                    ok = management_action_succeeded(resp.status, data)
                     return {
                         "name": name,
                         "updated": ok,
@@ -758,7 +767,7 @@ async def delete_names(base_url, token, names, delete_workers, timeout):
                 async with session.delete(url, headers=mgmt_headers(token), timeout=timeout) as resp:
                     text = await resp.text()
                     data = safe_json_text(text)
-                    ok = (200 <= resp.status < 300) or (resp.status == 200 and data.get("status") == "ok")
+                    ok = management_action_succeeded(resp.status, data, allow_no_content=True)
                     return {"name": name, "deleted": ok, "status": resp.status, "error": None if ok else text[:200]}
         except Exception as e:
             return {"name": name, "deleted": False, "status": None, "error": str(e)}
