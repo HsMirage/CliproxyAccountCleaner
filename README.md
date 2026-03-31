@@ -1,5 +1,11 @@
 # CliproxyAccountCleaner
 
+---
+
+<p align="center"><strong>⭐ <a href="https://github.com/HsMirage/AIPlanHub">AIPlanHub</a> — 一站式对比国内主流 AI 编程订阅方案，覆盖 9 大平台、25+ 套餐，帮你找到性价比最高的选择 ⭐</strong></p>
+
+---
+
 面向 CLIProxy 管理端的账号巡检与批量处理工具。
 
 当前提供 3 种运行方式：
