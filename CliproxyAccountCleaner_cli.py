@@ -471,6 +471,72 @@ def parse_window(name, window):
     }
 
 
+def select_quota_windows(windows):
+    """Pick weekly and short windows from wham/usage payloads.
+
+    Current observed Codex payloads use:
+    - primary_window: short window (about 5h)
+    - secondary_window: long window (about weekly)
+    - individual_window: sometimes also represents the long window
+    """
+    weekly_window = None
+    short_window = None
+
+    def is_seconds(value):
+        return isinstance(value, (int, float))
+
+    for window in windows:
+        lower_name = str(window.get("name") or "").lower()
+        seconds = window.get("limit_window_seconds")
+
+        if short_window is None:
+            if "primary" in lower_name or "short" in lower_name:
+                short_window = window
+            elif is_seconds(seconds) and seconds <= 6 * 3600:
+                short_window = window
+
+        if weekly_window is None:
+            if "individual" in lower_name or "weekly" in lower_name:
+                weekly_window = window
+            elif "secondary" in lower_name and (not is_seconds(seconds) or seconds > 6 * 3600):
+                weekly_window = window
+
+    with_seconds = [w for w in windows if is_seconds(w.get("limit_window_seconds"))]
+
+    if short_window is None and with_seconds:
+        short_window = min(with_seconds, key=lambda x: x["limit_window_seconds"])
+
+    if weekly_window is None and with_seconds:
+        sorted_windows = sorted(with_seconds, key=lambda x: x["limit_window_seconds"], reverse=True)
+        for window in sorted_windows:
+            if short_window is None or window.get("name") != short_window.get("name"):
+                weekly_window = window
+                break
+
+    if weekly_window is None and windows:
+        for window in windows:
+            if short_window is None or window.get("name") != short_window.get("name"):
+                weekly_window = window
+                break
+
+    if short_window is None and windows:
+        for window in windows:
+            if weekly_window is None or window.get("name") != weekly_window.get("name"):
+                short_window = window
+                break
+
+    if (
+        short_window is None
+        and weekly_window is not None
+        and is_seconds(weekly_window.get("limit_window_seconds"))
+        and weekly_window.get("limit_window_seconds") <= 6 * 3600
+    ):
+        short_window = weekly_window
+        weekly_window = None
+
+    return weekly_window, short_window
+
+
 def _contains_limit_error(value):
     """判断是否包含额度耗尽信号"""
     def _walk_texts(obj):
@@ -648,47 +714,7 @@ async def check_quota_batch(base_url, token, items, workers, timeout, target_typ
                                 if parsed is not None:
                                     windows.append(parsed)
 
-                            weekly_window = None
-                            short_window = None
-
-                            for window in windows:
-                                lower_name = str(window.get("name") or "").lower()
-                                if weekly_window is None and "individual" in lower_name:
-                                    weekly_window = window
-                                if short_window is None and "secondary" in lower_name:
-                                    short_window = window
-
-                            with_seconds = [w for w in windows if isinstance(w.get("limit_window_seconds"), (int, float))]
-                            if weekly_window is None and with_seconds:
-                                weekly_window = max(with_seconds, key=lambda x: x["limit_window_seconds"])
-
-                            if short_window is None and with_seconds:
-                                sorted_windows = sorted(with_seconds, key=lambda x: x["limit_window_seconds"])
-                                if weekly_window is None:
-                                    short_window = sorted_windows[0]
-                                else:
-                                    for window in sorted_windows:
-                                        if window.get("name") != weekly_window.get("name"):
-                                            short_window = window
-                                            break
-
-                            if weekly_window is None and windows:
-                                weekly_window = windows[0]
-
-                            if short_window is None and len(windows) > 1:
-                                for window in windows:
-                                    if weekly_window is None or window.get("name") != weekly_window.get("name"):
-                                        short_window = window
-                                        break
-
-                            if (
-                                short_window is None
-                                and weekly_window is not None
-                                and isinstance(weekly_window.get("limit_window_seconds"), (int, float))
-                                and weekly_window.get("limit_window_seconds") <= 6 * 3600
-                            ):
-                                short_window = weekly_window
-                                weekly_window = None
+                            weekly_window, short_window = select_quota_windows(windows)
 
                             weekly_used_percent = weekly_window.get("used_percent") if weekly_window else None
                             short_used_percent = short_window.get("used_percent") if short_window else None
