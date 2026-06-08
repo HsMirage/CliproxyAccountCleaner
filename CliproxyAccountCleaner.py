@@ -798,7 +798,7 @@ class EnhancedUI(_TK_BASE):
         if tk is None:
             raise RuntimeError("当前环境缺少 tkinter，无法启动桌面模式。")
         super().__init__()
-        self.title("CliproxyAccountCleaner v1.4.0")
+        self.title("CliproxyAccountCleaner v1.5.0")
         self.geometry("1220x760")
         self.minsize(1080, 640)
 
