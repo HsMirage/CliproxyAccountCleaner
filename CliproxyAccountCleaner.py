@@ -343,7 +343,11 @@ def _extract_quota_windows(usage_data):
     return rate_limit, windows, short_window, weekly_window
 
 
-async def _run_bounded(items, limit, make_coro):
+def _cancel_requested(cancel_event):
+    return bool(cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)())
+
+
+async def _run_bounded(items, limit, make_coro, cancel_event=None):
     """Run async jobs with bounded in-flight tasks.
     Avoid creating one task per item when item count is huge.
     """
@@ -353,6 +357,8 @@ async def _run_bounded(items, limit, make_coro):
     out = []
 
     for _ in range(limit):
+        if _cancel_requested(cancel_event):
+            break
         try:
             item = next(it)
         except StopIteration:
@@ -363,6 +369,8 @@ async def _run_bounded(items, limit, make_coro):
         done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             out.append(await task)
+            if _cancel_requested(cancel_event):
+                continue
             try:
                 item = next(it)
             except StopIteration:
@@ -383,6 +391,7 @@ async def probe_accounts(
     retries,
     refresh_candidates=True,
     refreshed_by_auth_index=None,
+    cancel_event=None,
 ):
     # 对齐额度检测：先尽量刷新 auth-files，避免使用旧快照导致误判
     if refreshed_by_auth_index is None:
@@ -423,6 +432,10 @@ async def probe_accounts(
 
         if not auth_index:
             result["error"] = "missing auth_index"
+            return result
+        if _cancel_requested(cancel_event):
+            result["error"] = "cancelled"
+            result["cancelled"] = True
             return result
 
         chatgpt_account_id = extract_chatgpt_account_id(item) or fallback_account_id
@@ -471,6 +484,7 @@ async def probe_accounts(
             refreshed_candidates,
             max(1, workers),
             lambda item: probe_one(session, sem, item),
+            cancel_event=cancel_event,
         )
     return out
 
@@ -488,6 +502,7 @@ async def check_quota_accounts(
     primary_quota_threshold,
     refresh_candidates=True,
     refreshed_by_auth_index=None,
+    cancel_event=None,
 ):
     # 对齐管理页刷新顺序：config.yaml -> auth-files -> api-call
     if refreshed_by_auth_index is None:
@@ -573,6 +588,10 @@ async def check_quota_accounts(
 
         if not auth_index:
             result["error"] = "missing auth_index"
+            return result
+        if _cancel_requested(cancel_event):
+            result["error"] = "cancelled"
+            result["cancelled"] = True
             return result
 
         chatgpt_account_id = extract_chatgpt_account_id(item) or fallback_account_id
@@ -705,17 +724,20 @@ async def check_quota_accounts(
             refreshed_candidates,
             max(1, workers),
             lambda item: quota_one(session, sem, item),
+            cancel_event=cancel_event,
         )
     return out
 
 
-async def set_disabled_names(base_url, token, names, disabled, workers, timeout):
+async def set_disabled_names(base_url, token, names, disabled, workers, timeout, cancel_event=None):
     """Toggle account disabled status via management endpoint.
     disabled=True  => close account
     disabled=False => enable account
     """
 
     async def set_one(session, sem, name):
+        if _cancel_requested(cancel_event):
+            return {"name": name, "updated": False, "disabled": bool(disabled), "status": None, "error": "cancelled", "cancelled": True}
         url = f"{base_url}/v0/management/auth-files/status"
         payload = {"name": name, "disabled": bool(disabled)}
         try:
@@ -754,20 +776,23 @@ async def set_disabled_names(base_url, token, names, disabled, workers, timeout)
             names,
             max(1, workers),
             lambda n: set_one(session, sem, n),
+            cancel_event=cancel_event,
         )
     return out
 
 
-async def close_names(base_url, token, names, close_workers, timeout):
-    return await set_disabled_names(base_url, token, names, True, close_workers, timeout)
+async def close_names(base_url, token, names, close_workers, timeout, cancel_event=None):
+    return await set_disabled_names(base_url, token, names, True, close_workers, timeout, cancel_event=cancel_event)
 
 
-async def enable_names(base_url, token, names, enable_workers, timeout):
-    return await set_disabled_names(base_url, token, names, False, enable_workers, timeout)
+async def enable_names(base_url, token, names, enable_workers, timeout, cancel_event=None):
+    return await set_disabled_names(base_url, token, names, False, enable_workers, timeout, cancel_event=cancel_event)
 
 
-async def delete_names(base_url, token, names, delete_workers, timeout):
+async def delete_names(base_url, token, names, delete_workers, timeout, cancel_event=None):
     async def delete_one(session, sem, name):
+        if _cancel_requested(cancel_event):
+            return {"name": name, "deleted": False, "status": None, "error": "cancelled", "cancelled": True}
         encoded = urllib.parse.quote(name, safe="")
         url = f"{base_url}/v0/management/auth-files?name={encoded}"
         try:
@@ -789,6 +814,7 @@ async def delete_names(base_url, token, names, delete_workers, timeout):
             names,
             max(1, delete_workers),
             lambda n: delete_one(session, sem, n),
+            cancel_event=cancel_event,
         )
     return out
 
@@ -798,7 +824,7 @@ class EnhancedUI(_TK_BASE):
         if tk is None:
             raise RuntimeError("当前环境缺少 tkinter，无法启动桌面模式。")
         super().__init__()
-        self.title("CliproxyAccountCleaner v1.5.0")
+        self.title("CliproxyAccountCleaner v1.5.1")
         self.geometry("1220x760")
         self.minsize(1080, 640)
 
@@ -810,11 +836,70 @@ class EnhancedUI(_TK_BASE):
         self._layout_update_job = None
         self._on_help_page = False
         self._config_save_job = None
+        self._active_batch_cancel = None
+        self._active_batch_name = ""
+        self._active_batch_running = False
+        self._batch_buttons = []
+        self.cancel_batch_btn = None
 
         self._init_config_vars()
         self._setup_styles()
         self._build()
         self._load_accounts()
+
+    def _add_batch_button(self, parent, **kwargs):
+        padx = kwargs.pop("padx", 0)
+        btn = ttk.Button(parent, **kwargs)
+        btn.pack(side="left", padx=padx)
+        self._batch_buttons.append(btn)
+        return btn
+
+    def _set_batch_buttons_running(self, running):
+        state = "disabled" if running else "normal"
+        for btn in self._batch_buttons:
+            try:
+                btn.configure(state=state)
+            except Exception:
+                pass
+        if self.cancel_batch_btn is not None:
+            try:
+                self.cancel_batch_btn.configure(state="normal" if running else "disabled")
+            except Exception:
+                pass
+
+    def _begin_batch_task(self, label):
+        if self._active_batch_running:
+            messagebox.showinfo("批量操作进行中", f"当前正在执行：{self._active_batch_name or '批量操作'}。请先终止或等待完成。")
+            return None
+        cancel_event = threading.Event()
+        self._active_batch_cancel = cancel_event
+        self._active_batch_name = str(label or "批量操作")
+        self._active_batch_running = True
+        self._set_batch_buttons_running(True)
+        return cancel_event
+
+    def _request_cancel_batch_task(self):
+        if not self._active_batch_running or self._active_batch_cancel is None:
+            self.action_progress.set("当前没有可终止的批量操作")
+            return
+        self._active_batch_cancel.set()
+        self.action_progress.set(f"正在终止：{self._active_batch_name}，等待已发出的请求收尾...")
+        if self.cancel_batch_btn is not None:
+            try:
+                self.cancel_batch_btn.configure(state="disabled")
+            except Exception:
+                pass
+
+    def _finish_batch_task(self, message="", cancel_event=None):
+        cancelled = _cancel_requested(cancel_event or self._active_batch_cancel)
+        self._active_batch_cancel = None
+        self._active_batch_name = ""
+        self._active_batch_running = False
+        self._set_batch_buttons_running(False)
+        if message:
+            prefix = "已终止（部分完成）：" if cancelled else ""
+            self.action_progress.set(prefix + str(message))
+        return cancelled
 
     def _init_config_vars(self):
         self.base_url_var = tk.StringVar(value=str(self.conf.get("base_url") or ""))
@@ -1053,14 +1138,16 @@ class EnhancedUI(_TK_BASE):
         ops_row.pack(fill="x")
         ttk.Button(ops_row, text="全选", command=self.select_all, style="Neutral.TButton").pack(side="left")
         ttk.Button(ops_row, text="取消全选", command=self.select_none, style="Neutral.TButton").pack(side="left", padx=(6, 10))
-        ttk.Button(ops_row, text="检测401无效", command=self.check_401, style="Primary.TButton").pack(side="left", padx=(0, 6))
-        ttk.Button(ops_row, text="检测额度", command=self.check_quota, style="Primary.TButton").pack(side="left", padx=6)
-        ttk.Button(ops_row, text="检测(401+额度)", command=self.check_both, style="Primary.TButton").pack(side="left", padx=6)
-        ttk.Button(ops_row, text="关闭选中账号", command=self.close_selected, style="Warn.TButton").pack(side="left", padx=6)
-        ttk.Button(ops_row, text="恢复已关闭", command=self.recover_closed_accounts, style="Neutral.TButton").pack(side="left", padx=6)
-        ttk.Button(ops_row, text="加入备用池", command=self.add_selected_to_standby, style="Neutral.TButton").pack(side="left", padx=6)
-        ttk.Button(ops_row, text="备用转活跃", command=self.remove_selected_from_standby, style="Neutral.TButton").pack(side="left", padx=6)
-        ttk.Button(ops_row, text="永久删除", command=self.delete_selected, style="Danger.TButton").pack(side="left", padx=(6, 0))
+        self._add_batch_button(ops_row, text="检测401无效", command=self.check_401, style="Primary.TButton", padx=(0, 6))
+        self._add_batch_button(ops_row, text="检测额度", command=self.check_quota, style="Primary.TButton", padx=6)
+        self._add_batch_button(ops_row, text="检测(401+额度)", command=self.check_both, style="Primary.TButton", padx=6)
+        self._add_batch_button(ops_row, text="关闭选中账号", command=self.close_selected, style="Warn.TButton", padx=6)
+        self._add_batch_button(ops_row, text="恢复已关闭", command=self.recover_closed_accounts, style="Neutral.TButton", padx=6)
+        self._add_batch_button(ops_row, text="加入备用池", command=self.add_selected_to_standby, style="Neutral.TButton", padx=6)
+        self._add_batch_button(ops_row, text="备用转活跃", command=self.remove_selected_from_standby, style="Neutral.TButton", padx=6)
+        self._add_batch_button(ops_row, text="永久删除", command=self.delete_selected, style="Danger.TButton", padx=6)
+        self.cancel_batch_btn = ttk.Button(ops_row, text="终止", command=self._request_cancel_batch_task, style="Danger.TButton", state="disabled")
+        self.cancel_batch_btn.pack(side="left", padx=(6, 0))
 
         self.action_progress = tk.StringVar(value="")
         ttk.Label(ops, textvariable=self.action_progress, style="Subtle.TLabel").pack(fill="x", pady=(6, 0))
@@ -1109,7 +1196,7 @@ class EnhancedUI(_TK_BASE):
         ttk.Label(help_card, text="一、快速上手", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
         ttk.Label(help_card, text="1) 填写“管理端地址(base_url)”和“访问令牌(token/cpa_password)”。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="2) 点击“刷新账号列表”，确认账号已加载。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
-        ttk.Label(help_card, text="3) 活跃账号目标数（全局参数）：在自动巡检、检测、移出备用、恢复已关闭等涉及开启账号的流程中都会生效；系统会把活跃账号控制在目标数以内。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="3) 活跃账号目标数：自动巡检、自动补齐、自动平衡会严格控制在目标数以内；手动“备用转活跃/恢复已关闭”会先扫描，若会超出目标数则二次确认，不再静默跳过。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="4) 不足时允许从已关闭账号补齐（全局参数）：开启后，备用池不够时会继续扫描已关闭账号。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="5) 先执行“检测401无效 / 检测额度 / 联合检测”，再进行关闭、恢复、删除。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="6) 401无效账号推荐删除 / 无额度账号推荐关闭 / 其他普通报错账号默认按活跃展示", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
@@ -1122,23 +1209,23 @@ class EnhancedUI(_TK_BASE):
         ttk.Label(help_card, text="- 状态判定采用统一优先级（从高到低）：401无效 > 备用 > 已关闭 > 额度耗尽 > 活跃 > 未知。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="- 活跃：包含检测通过账号，以及非401/非额度耗尽的普通报错账号。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="- 未知：新导入的账号，尚未完成有效检测（建议优先检测）。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
-        ttk.Label(help_card, text="- 已关闭：手动关闭的账号，可通过点击“恢复已关闭”按钮检测后恢复使用。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 已关闭：手动关闭的账号，可通过点击“恢复已关闭”按钮检测后恢复；若超出活跃目标数会二次确认，取消时保持已关闭。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="- 备用：账号在备用池中，默认不参与主流程。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="- 401无效：认证无效账号，可直接删除，无限保留。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
-        ttk.Label(help_card, text="- 额度耗尽：命中额度阈值或限额信号，且不属于401。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 额度耗尽：命中周额度阈值、5小时阈值、剩余为0、限流标志或状态信号，且不属于401；额度详情优先展示周额度，5小时与判定来源作为辅助信息。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="- 若账号同时命中多个状态（如既在备用池又401失效），界面会优先显示“401无效”。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Separator(help_card, orient="horizontal").pack(fill="x", pady=(2, 8))
 
         ttk.Label(help_card, text="三、备用池说明", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
         ttk.Label(help_card, text="- 加入备用池：将选中账号加入备用列表，并立即关闭账号。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
-        ttk.Label(help_card, text="- 备用转活跃：会先做 401+额度检测，仅“状态正常且非额度耗尽”的账号会开启并移入活跃账号池，并且移出备用池。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
-        ttk.Label(help_card, text="- 自动补齐活跃账号时，系统会优先从备用池挑选可恢复账号。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 8))
+        ttk.Label(help_card, text="- 备用转活跃：会先做 401+额度检测，仅“状态正常且非额度耗尽”的账号会开启并移入活跃账号池；若超出活跃目标数会二次确认，取消时继续留在备用池。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 自动补齐活跃账号时，系统会优先从备用池挑选可恢复账号，并严格遵守活跃账号目标数。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 8))
 
         ttk.Separator(help_card, orient="horizontal").pack(fill="x", pady=(2, 8))
 
         ttk.Label(help_card, text="四、自动巡检说明（重点）", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
         ttk.Label(help_card, text="- 巡检间隔：按分钟周期执行。启动后会先立即执行一次。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
-        ttk.Label(help_card, text="- 401处理：删除/仅标记；额度处理：关闭/删除/仅标记（按你的下拉选项执行）。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 8))
+        ttk.Label(help_card, text="- 401处理：删除/仅标记；额度处理：关闭/删除/仅标记（按你的下拉选项执行）；自动巡检严格遵守活跃账号目标数。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 8))
 
         ttk.Separator(help_card, orient="horizontal").pack(fill="x", pady=(2, 8))
 
@@ -2098,52 +2185,64 @@ class EnhancedUI(_TK_BASE):
         quota_source = account.get("quota_source")
 
         if used_percent is not None:
-            source_name = ""
-            if quota_source == "weekly":
-                source_name = "周"
-            elif quota_source == "5hour":
-                source_name = "5小时"
-            elif quota_source == "remaining":
-                source_name = "剩余"
-            elif quota_source == "status_message":
-                source_name = "状态"
-            elif quota_source == "weekly_limit":
-                source_name = "周限额"
-            elif quota_source == "5hour_limit":
-                source_name = "5小时限额"
-            elif quota_source == "rate_limit_flag":
-                source_name = "限流"
+            source_name = {
+                "weekly": "周额度",
+                "5hour": "5小时额度",
+                "remaining": "剩余为0",
+                "status_message": "状态信号",
+                "weekly_limit": "周限额",
+                "5hour_limit": "5小时限额",
+                "rate_limit_flag": "限流标志",
+            }.get(str(quota_source or ""), "")
 
             weekly_percent = account.get("individual_used_percent")
             short_percent = account.get("primary_used_percent")
-            reset_time = ""
-            if account.get("reset_at"):
+
+            def fmt_reset(value):
+                if not value:
+                    return ""
                 try:
-                    reset_time = datetime.fromtimestamp(account["reset_at"]).strftime("%Y-%m-%d %H:%M")
+                    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
                 except Exception:
-                    reset_time = ""
+                    return ""
+
+            weekly_reset = fmt_reset(account.get("individual_reset_at"))
+            short_reset = fmt_reset(account.get("primary_reset_at"))
+            reset_time = fmt_reset(account.get("reset_at"))
 
             if self._compact_usage_mode:
-                compact_parts = [f"使用{used_percent}%"]
+                compact_parts = []
                 if weekly_percent is not None:
                     compact_parts.append(f"周{weekly_percent}%")
                 if short_percent is not None:
                     compact_parts.append(f"5h{short_percent}%")
-                if reset_time:
+                if not compact_parts:
+                    compact_parts.append(f"使用{used_percent}%")
+                if weekly_reset:
+                    compact_parts.append(f"周重置{weekly_reset[5:]}")
+                elif short_reset:
+                    compact_parts.append(f"5h重置{short_reset[5:]}")
+                elif reset_time:
                     compact_parts.append(f"重置{reset_time[5:]}")
                 if source_name:
-                    compact_parts.append(source_name)
+                    compact_parts.append(f"判定:{source_name}")
                 return " | ".join(compact_parts)
 
-            parts = [f"使用率: {used_percent}%"]
+            parts = []
             if weekly_percent is not None:
                 parts.append(f"周: {weekly_percent}%")
             if short_percent is not None:
                 parts.append(f"5小时: {short_percent}%")
-            if reset_time:
+            if not parts:
+                parts.append(f"使用率: {used_percent}%")
+            if weekly_reset:
+                parts.append(f"周重置: {weekly_reset}")
+            if short_reset:
+                parts.append(f"5小时重置: {short_reset}")
+            if reset_time and reset_time not in {weekly_reset, short_reset}:
                 parts.append(f"重置: {reset_time}")
             if source_name:
-                parts.append(f"来源: {source_name}")
+                parts.append(f"判定: {source_name}")
             return " | ".join(parts)
 
         usage_limit = account.get("usage_limit") or ""
@@ -2265,8 +2364,6 @@ class EnhancedUI(_TK_BASE):
         ):
             return
 
-        self.action_progress.set(f"正在加入备用并关闭账号... 数量={len(names)}")
-
         try:
             rt = self._runtime()
         except Exception as e:
@@ -2274,19 +2371,25 @@ class EnhancedUI(_TK_BASE):
             self.action_progress.set("加入备用失败")
             return
 
+        cancel_event = self._begin_batch_task("加入备用池")
+        if cancel_event is None:
+            return
+        self.action_progress.set(f"正在加入备用并关闭账号... 数量={len(names)}")
+
         def worker():
             try:
                 close_results = asyncio.run(
-                    close_names(rt["base_url"], rt["token"], names, rt["close_workers"], rt["timeout"])
+                    close_names(rt["base_url"], rt["token"], names, rt["close_workers"], rt["timeout"], cancel_event=cancel_event)
                 )
-                self.after(0, self._add_standby_done, close_results)
+                self.after(0, self._add_standby_done, close_results, cancel_event)
             except Exception as e:
                 self.after(0, messagebox.showerror, "加入备用失败", str(e))
                 self.after(0, self.action_progress.set, "加入备用失败")
+                self.after(0, self._finish_batch_task, "加入备用失败", cancel_event)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _add_standby_done(self, close_results):
+    def _add_standby_done(self, close_results, cancel_event=None):
         ok = [r.get("name") for r in close_results if r.get("updated") and r.get("name")]
         bad = [r for r in close_results if not r.get("updated")]
 
@@ -2298,7 +2401,7 @@ class EnhancedUI(_TK_BASE):
         except Exception as e:
             messagebox.showwarning("加入备用结果", f"备用文件写入失败:\n{e}")
         self._save_config()
-        self.action_progress.set(f"加入备用完成：成功={len(ok)} 失败={len(bad)}")
+        cancelled = self._finish_batch_task(f"加入备用完成：成功={len(ok)} 失败={len(bad)}", cancel_event)
 
         if bad:
             msg = "以下账号加入备用失败：\n" + "\n".join([f"- {r.get('name')}: {r.get('error')}" for r in bad[:15]])
@@ -2325,7 +2428,8 @@ class EnhancedUI(_TK_BASE):
             "确认移出备用",
             (
                 f"将对选中的 {len(standby_selected)} 个备用账号执行 401 + 额度扫描。\n"
-                "仅状态正常且非额度耗尽账号会被开启并移出备用。\n\n"
+                "仅状态正常且非额度耗尽账号会被开启并移出备用。\n"
+                "若开启后会超出活跃账号目标数，将在扫描完成后再次确认。\n\n"
                 "继续吗？"
             ),
         ):
@@ -2357,40 +2461,25 @@ class EnhancedUI(_TK_BASE):
         available_slots_text = "不限" if active_target_meta.get("unlimited") else str(available_slots_before)
         gap_rescan_summary = None
         if (not active_target_meta.get("unlimited")) and available_slots_before <= 0:
-            self.action_progress.set("当前差值=0，先复扫活跃账号以校准缺口...")
+            self.action_progress.set("当前差值=0，先复扫活跃账号以校准缺口；手动操作不会静默跳过...")
             gap_rescan_summary = self._rescan_active_and_refresh_gap(rt, target_active, current_active_before)
             current_active_before = int(gap_rescan_summary.get("active_after") or current_active_before)
             available_slots_before = int(gap_rescan_summary.get("available_slots_after") or 0)
             available_slots_text = str(available_slots_before)
-            if available_slots_before <= 0:
-                extra_lines = [
-                    f"活跃复扫：扫描={int(gap_rescan_summary.get('scanned') or 0)}",
-                    f"发现401={int(gap_rescan_summary.get('invalid_401') or 0)}",
-                    f"发现额度耗尽={int(gap_rescan_summary.get('invalid_quota') or 0)}",
-                ]
-                if gap_rescan_summary.get("errors"):
-                    extra_lines.append("复扫异常: " + " | ".join((gap_rescan_summary.get("errors") or [])[:3]))
-                self.action_progress.set("移出备用已跳过：复扫后可开启名额仍为0")
-                messagebox.showinfo(
-                    "移出备用",
-                    (
-                        f"复扫后仍无可开启名额（目标={target_active}，当前活跃={current_active_before}）。\n"
-                        "本次不会从备用池补齐。\n\n"
-                        + "\n".join(extra_lines)
-                    ),
-                )
-                return
 
-        scan_need_count = None if active_target_meta.get("unlimited") else max(0, available_slots_before)
-        scan_need_text = "全量扫描" if scan_need_count is None else f"按缺口扫描，最多补齐 {scan_need_count} 个"
+        scan_need_count = None
+        scan_need_text = "手动全量扫描；若可用账号会超出目标数，将在扫描后确认"
 
         self.action_progress.set(
-            f"正在检测备用账号并尝试移出... 候选={len(candidates)} | 目标={target_active} 当前活跃={current_active_before} 可开启名额={available_slots_text} | {scan_need_text}"
+            f"正在检测备用账号... 候选={len(candidates)} | 目标={target_active} 当前活跃={current_active_before} 可开启名额={available_slots_text} | {scan_need_text}"
         )
+        cancel_event = self._begin_batch_task("备用转活跃")
+        if cancel_event is None:
+            return
 
         def worker():
             try:
-                scan_summary = self._scan_for_recovery(rt, candidates, need_count=scan_need_count)
+                scan_summary = self._scan_for_recovery(rt, candidates, need_count=scan_need_count, cancel_event=cancel_event)
                 probe_by_identity = scan_summary.get("probe_by_name") or {}
                 quota_by_identity = scan_summary.get("quota_by_name") or {}
                 probe_results = list(probe_by_identity.values())
@@ -2399,7 +2488,31 @@ class EnhancedUI(_TK_BASE):
                 recoverable_names = list(scan_summary.get("recoverable") or [])
                 limit_meta = self._pick_names_with_active_target_limit(recoverable_names)
                 if isinstance(limit_meta, dict):
+                    available_slots = None if limit_meta.get("unlimited") else max(0, int(limit_meta.get("available_slots") or 0))
+                    would_exceed = (not limit_meta.get("unlimited")) and len(recoverable_names) > available_slots
+                    selected_names = recoverable_names
+                    if would_exceed:
+                        self.after(
+                            0,
+                            self._confirm_manual_enable_after_standby_scan,
+                            standby_selected,
+                            candidates,
+                            probe_results,
+                            quota_results,
+                            dict(limit_meta),
+                            int(scan_summary.get("scanned") or 0),
+                            scan_need_count,
+                            list(scan_summary.get("errors") or []),
+                            gap_rescan_summary or {},
+                            cancel_event,
+                        )
+                        return
                     limit_meta = dict(limit_meta)
+                    limit_meta["selected"] = selected_names
+                    limit_meta["skipped"] = []
+                    limit_meta["manual_override"] = True
+                    limit_meta["manual_confirmed"] = False
+                    limit_meta["would_exceed_target"] = False
                     limit_meta["scanned"] = int(scan_summary.get("scanned") or 0)
                     limit_meta["recoverable_detected"] = len(recoverable_names)
                     limit_meta["scan_need_count"] = scan_need_count
@@ -2417,6 +2530,7 @@ class EnhancedUI(_TK_BASE):
                             names_to_enable,
                             rt["enable_workers"],
                             rt["timeout"],
+                            cancel_event=cancel_event,
                         )
                     )
 
@@ -2429,14 +2543,107 @@ class EnhancedUI(_TK_BASE):
                     quota_results,
                     enable_results,
                     limit_meta,
+                    cancel_event,
                 )
             except Exception as e:
                 self.after(0, messagebox.showerror, "移出备用失败", str(e))
                 self.after(0, self.action_progress.set, "移出备用失败")
+                self.after(0, self._finish_batch_task, "备用转活跃失败", cancel_event)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _remove_standby_scan_done(self, standby_selected, candidate_raws, probe_results, quota_results, enable_results, limit_meta=None):
+    def _confirm_manual_enable_after_standby_scan(self, standby_selected, candidate_raws, probe_results, quota_results, limit_meta, scanned_count, scan_need_count, scan_errors, gap_rescan_summary, cancel_event=None):
+        recoverable_names = []
+        for n in list(limit_meta.get("selected") or []) + list(limit_meta.get("skipped") or []):
+            name = str(n or "").strip()
+            if name and name not in recoverable_names:
+                recoverable_names.append(name)
+
+        target_active = int(limit_meta.get("target_active") or 0)
+        current_active = int(limit_meta.get("current_active") or 0)
+        available_slots = max(0, int(limit_meta.get("available_slots") or 0))
+        overflow_count = max(0, len(recoverable_names) - available_slots)
+
+        ok = messagebox.askyesno(
+            "确认超出活跃目标",
+            (
+                f"本次检测到 {len(recoverable_names)} 个备用账号可转为活跃。\n"
+                f"当前活跃目标={target_active}，当前活跃={current_active}，可开启名额={available_slots}。\n"
+                f"如果继续，将超出目标数约 {overflow_count} 个账号。\n\n"
+                "是否仍按你的手动选择继续开启这些可用备用账号？\n"
+                "选择“否”会保留它们在备用池中。"
+            ),
+        )
+
+        if not ok:
+            limit_meta = dict(limit_meta)
+            limit_meta["selected"] = []
+            limit_meta["skipped"] = recoverable_names
+            limit_meta["manual_cancelled"] = True
+            limit_meta["would_exceed_target"] = True
+            limit_meta["scanned"] = int(scanned_count or 0)
+            limit_meta["recoverable_detected"] = len(recoverable_names)
+            limit_meta["scan_need_count"] = scan_need_count
+            limit_meta["scan_errors"] = list(scan_errors or [])
+            limit_meta["gap_rescan_summary"] = gap_rescan_summary or {}
+            self._remove_standby_scan_done(standby_selected, candidate_raws, probe_results, quota_results, [], limit_meta, cancel_event)
+            return
+
+        limit_meta = dict(limit_meta)
+        limit_meta["selected"] = recoverable_names
+        limit_meta["skipped"] = []
+        limit_meta["manual_override"] = True
+        limit_meta["manual_confirmed"] = True
+        limit_meta["would_exceed_target"] = True
+        limit_meta["scanned"] = int(scanned_count or 0)
+        limit_meta["recoverable_detected"] = len(recoverable_names)
+        limit_meta["scan_need_count"] = scan_need_count
+        limit_meta["scan_errors"] = list(scan_errors or [])
+        limit_meta["gap_rescan_summary"] = gap_rescan_summary or {}
+
+        try:
+            rt = self._runtime()
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            limit_meta["selected"] = []
+            limit_meta["skipped"] = recoverable_names
+            limit_meta["manual_cancelled"] = True
+            self._remove_standby_scan_done(standby_selected, candidate_raws, probe_results, quota_results, [], limit_meta, cancel_event)
+            return
+
+        self.action_progress.set(f"正在开启 {len(recoverable_names)} 个备用账号...")
+
+        def worker():
+            try:
+                enable_results = asyncio.run(
+                    enable_names(
+                        rt["base_url"],
+                        rt["token"],
+                        recoverable_names,
+                        rt["enable_workers"],
+                        rt["timeout"],
+                        cancel_event=cancel_event,
+                    )
+                )
+                self.after(
+                    0,
+                    self._remove_standby_scan_done,
+                    standby_selected,
+                    candidate_raws,
+                    probe_results,
+                    quota_results,
+                    enable_results,
+                    limit_meta,
+                    cancel_event,
+                )
+            except Exception as e:
+                self.after(0, messagebox.showerror, "备用转活跃失败", str(e))
+                self.after(0, self.action_progress.set, "备用转活跃失败")
+                self.after(0, self._finish_batch_task, "备用转活跃失败", cancel_event)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _remove_standby_scan_done(self, standby_selected, candidate_raws, probe_results, quota_results, enable_results, limit_meta=None, cancel_event=None):
         probe_by_identity, _probe_conflicts = self._index_results_by_identity(probe_results)
         quota_by_identity, _quota_conflicts = self._index_results_by_identity(quota_results)
         enable_by_name = {r.get("name"): r for r in enable_results if r.get("name")}
@@ -2597,7 +2804,7 @@ class EnhancedUI(_TK_BASE):
         recoverable_count = recoverable
         enabled_count = active_count
 
-        self.action_progress.set(f"移出备用完成：活跃={active_count} 401={moved_401_count} 已关闭={moved_closed_count}")
+        cancelled = self._finish_batch_task(f"移出备用完成：活跃={active_count} 401={moved_401_count} 已关闭={moved_closed_count}", cancel_event)
 
         msg_lines = [
             f"活跃目标门控：目标={target_active}，当前活跃={current_active_before}，可开启名额={available_slots_text}",
@@ -2631,7 +2838,12 @@ class EnhancedUI(_TK_BASE):
         if detect_errors > 0:
             msg_lines.append(f"检测异常：{detect_errors}")
         if skipped_by_target > 0:
-            msg_lines.append(f"受全局活跃目标数限制未开启：{skipped_by_target}")
+            if limit_data.get("manual_cancelled"):
+                msg_lines.append(f"用户取消超目标开启，继续留在备用池：{skipped_by_target}")
+            else:
+                msg_lines.append(f"受全局活跃目标数限制未开启，继续留在备用池：{skipped_by_target}")
+        if limit_data.get("manual_confirmed"):
+            msg_lines.append("本次为手动确认超出活跃目标后开启。")
 
         messagebox.showinfo("移出备用结果", "\n".join(msg_lines))
 
@@ -2893,7 +3105,7 @@ class EnhancedUI(_TK_BASE):
         # 活跃目标模式下严格按“并发”作为每批扫描量
         return workers
 
-    def _scan_for_recovery(self, rt, candidates, need_count=None):
+    def _scan_for_recovery(self, rt, candidates, need_count=None, cancel_event=None):
         if not candidates:
             return {
                 "scanned": 0,
@@ -2905,6 +3117,7 @@ class EnhancedUI(_TK_BASE):
                 "probe_by_name": {},
                 "quota_by_name": {},
                 "merge_conflict_count": 0,
+                "cancelled": _cancel_requested(cancel_event),
             }
 
         target_count = None
@@ -2924,7 +3137,23 @@ class EnhancedUI(_TK_BASE):
                     "probe_by_name": {},
                     "quota_by_name": {},
                     "merge_conflict_count": 0,
+                    "cancelled": _cancel_requested(cancel_event),
                 }
+
+        cancelled = _cancel_requested(cancel_event)
+        if cancelled:
+            return {
+                "scanned": 0,
+                "recoverable": [],
+                "invalid_401": [],
+                "invalid_quota": [],
+                "limit_only_quota": [],
+                "errors": [],
+                "probe_by_name": {},
+                "quota_by_name": {},
+                "merge_conflict_count": 0,
+                "cancelled": True,
+            }
 
         recoverable_names = []
         recoverable_set = set()
@@ -2954,6 +3183,9 @@ class EnhancedUI(_TK_BASE):
             chunk_size = max(1, min(len(candidates), batch_size))
 
         for i in range(0, len(candidates), chunk_size):
+            if _cancel_requested(cancel_event):
+                cancelled = True
+                break
             if target_count is not None and len(recoverable_names) >= target_count:
                 break
 
@@ -2973,24 +3205,30 @@ class EnhancedUI(_TK_BASE):
                     rt["retries"],
                     refresh_candidates=False,
                     refreshed_by_auth_index=refreshed_by_auth_index,
+                    cancel_event=cancel_event,
                 )
             )
-            quota_results = asyncio.run(
-                check_quota_accounts(
-                    rt["base_url"],
-                    rt["token"],
-                    chunk,
-                    rt["user_agent"],
-                    rt["chatgpt_account_id"],
-                    rt["quota_workers"],
-                    rt["timeout"],
-                    rt["retries"],
-                    rt["weekly_quota_threshold"],
-                    rt["primary_quota_threshold"],
-                    refresh_candidates=False,
-                    refreshed_by_auth_index=refreshed_by_auth_index,
+            if _cancel_requested(cancel_event):
+                cancelled = True
+                quota_results = []
+            else:
+                quota_results = asyncio.run(
+                    check_quota_accounts(
+                        rt["base_url"],
+                        rt["token"],
+                        chunk,
+                        rt["user_agent"],
+                        rt["chatgpt_account_id"],
+                        rt["quota_workers"],
+                        rt["timeout"],
+                        rt["retries"],
+                        rt["weekly_quota_threshold"],
+                        rt["primary_quota_threshold"],
+                        refresh_candidates=False,
+                        refreshed_by_auth_index=refreshed_by_auth_index,
+                        cancel_event=cancel_event,
+                    )
                 )
-            )
 
             scanned_count += len(chunk)
 
@@ -3041,6 +3279,7 @@ class EnhancedUI(_TK_BASE):
             "probe_by_name": probe_result_by_name,
             "quota_by_name": quota_result_by_name,
             "merge_conflict_count": merge_conflict_count,
+            "cancelled": cancelled or _cancel_requested(cancel_event),
         }
 
     def _close_names_to_standby(self, rt, names):
@@ -3115,7 +3354,7 @@ class EnhancedUI(_TK_BASE):
             "move_errors": list(move_result.get("move_errors") or []),
         }
 
-    def _scan_active_candidates_and_apply(self, rt, active_candidates, need_count=None):
+    def _scan_active_candidates_and_apply(self, rt, active_candidates, need_count=None, cancel_event=None):
         if not active_candidates:
             return {
                 "scanned": 0,
@@ -3125,6 +3364,7 @@ class EnhancedUI(_TK_BASE):
                 "actions": {"deleted": [], "closed": [], "delete_errors": [], "close_errors": []},
                 "scan_errors": [],
                 "merge_conflict_count": 0,
+                "cancelled": _cancel_requested(cancel_event),
             }
 
         target_count = None
@@ -3924,6 +4164,9 @@ class EnhancedUI(_TK_BASE):
         available_slots_before = int(active_target_meta.get("available_slots") or 0)
         available_slots_text = "不限" if active_target_meta.get("unlimited") else str(available_slots_before)
 
+        cancel_event = self._begin_batch_task("检测 401 失效")
+        if cancel_event is None:
+            return
         self.action_progress.set(
             f"正在检测 401 失效... 候选={len(candidates)} | 目标={target_active} 当前活跃={current_active_before} 可开启名额={available_slots_text}"
         )
@@ -3940,18 +4183,20 @@ class EnhancedUI(_TK_BASE):
                         rt["workers"],
                         rt["timeout"],
                         rt["retries"],
+                        cancel_event=cancel_event,
                     )
                 )
                 invalid_401 = [r for r in results if r.get("invalid_401")]
                 write_json_file(rt["output"], invalid_401)
-                self.after(0, self._check_401_done, results, rt["output"], active_target_meta)
+                self.after(0, self._check_401_done, results, rt["output"], active_target_meta, cancel_event)
             except Exception as e:
                 self.after(0, messagebox.showerror, "401 检测失败", str(e))
                 self.after(0, self.action_progress.set, "401 检测失败")
+                self.after(0, self._finish_batch_task, "401 检测失败", cancel_event)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _check_401_done(self, results, output_path, active_target_meta=None):
+    def _check_401_done(self, results, output_path, active_target_meta=None, cancel_event=None):
         probe_by_identity, _probe_conflicts = self._index_results_by_identity(results)
 
         limit_meta = active_target_meta if isinstance(active_target_meta, dict) else self._build_active_target_meta()
@@ -3976,16 +4221,18 @@ class EnhancedUI(_TK_BASE):
 
         snapshot = self._record_active_quota_snapshot("401")
 
+        cancelled_now = _cancel_requested(cancel_event)
         rebalance_summary = None
-        try:
-            rt = self._runtime()
-            rebalance_summary = self._rebalance_active_target_by_runtime(rt)
-        except Exception as e:
-            rebalance_summary = {"error": str(e)}
+        if not cancelled_now:
+            try:
+                rt = self._runtime()
+                rebalance_summary = self._rebalance_active_target_by_runtime(rt)
+            except Exception as e:
+                rebalance_summary = {"error": str(e)}
 
         self._load_accounts()
         self._apply_filter()
-        self.action_progress.set(f"401 检测完成：无效={invalid_count} 异常={error_count}")
+        cancelled = self._finish_batch_task(f"401 检测完成：无效={invalid_count} 异常={error_count}", cancel_event)
         msg_lines = [
             f"活跃目标门控：目标={target_active}，当前活跃={current_active_before}，可开启名额={available_slots_text}",
             f"401无效：{invalid_count}",
@@ -4024,6 +4271,9 @@ class EnhancedUI(_TK_BASE):
                 messagebox.showinfo("额度检测", "没有符合条件（活跃（含普通报错）/未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             return
 
+        cancel_event = self._begin_batch_task("额度检测")
+        if cancel_event is None:
+            return
         self.action_progress.set(f"正在检测额度状态... 候选={len(candidates)}")
 
         def worker():
@@ -4040,18 +4290,20 @@ class EnhancedUI(_TK_BASE):
                         rt["retries"],
                         rt["weekly_quota_threshold"],
                         rt["primary_quota_threshold"],
+                        cancel_event=cancel_event,
                     )
                 )
                 invalid_quota = [r for r in results if r.get("invalid_quota")]
                 write_json_file(rt["quota_output"], invalid_quota)
-                self.after(0, self._check_quota_done, results, rt["quota_output"])
+                self.after(0, self._check_quota_done, results, rt["quota_output"], cancel_event)
             except Exception as e:
                 self.after(0, messagebox.showerror, "额度检测失败", str(e))
                 self.after(0, self.action_progress.set, "额度检测失败")
+                self.after(0, self._finish_batch_task, "额度检测失败", cancel_event)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _check_quota_done(self, results, output_path):
+    def _check_quota_done(self, results, output_path, cancel_event=None):
         quota_by_identity, _quota_conflicts = self._index_results_by_identity(results)
 
         quota_count = 0
@@ -4077,16 +4329,18 @@ class EnhancedUI(_TK_BASE):
 
         snapshot = self._record_active_quota_snapshot("quota")
 
+        cancelled_now = _cancel_requested(cancel_event)
         rebalance_summary = None
-        try:
-            rt = self._runtime()
-            rebalance_summary = self._rebalance_active_target_by_runtime(rt)
-        except Exception as e:
-            rebalance_summary = {"error": str(e)}
+        if not cancelled_now:
+            try:
+                rt = self._runtime()
+                rebalance_summary = self._rebalance_active_target_by_runtime(rt)
+            except Exception as e:
+                rebalance_summary = {"error": str(e)}
 
         self._load_accounts()
         self._apply_filter()
-        self.action_progress.set(f"额度检测完成：额度耗尽={quota_count} 异常={error_count}")
+        cancelled = self._finish_batch_task(f"额度检测完成：额度耗尽={quota_count} 异常={error_count}", cancel_event)
         msg = f"额度耗尽: {quota_count}\n检测异常: {error_count}\n导出文件: {output_path}\n活跃额度记录: {snapshot.get('count', 0)} 条\n记录文件: {snapshot.get('path')}"
         if snapshot.get("error"):
             msg += f"\n记录失败: {snapshot.get('error')}"
@@ -4129,6 +4383,9 @@ class EnhancedUI(_TK_BASE):
         available_slots_before = int(active_target_meta.get("available_slots") or 0)
         available_slots_text = "不限" if active_target_meta.get("unlimited") else str(available_slots_before)
 
+        cancel_event = self._begin_batch_task("联合检测（401+额度）")
+        if cancel_event is None:
+            return
         self.action_progress.set(
             f"正在联合检测（401+额度）... 候选={len(candidates)} | 目标={target_active} 当前活跃={current_active_before} 可开启名额={available_slots_text}"
         )
@@ -4145,22 +4402,26 @@ class EnhancedUI(_TK_BASE):
                         rt["workers"],
                         rt["timeout"],
                         rt["retries"],
+                        cancel_event=cancel_event,
                     )
                 )
-                quota_results = asyncio.run(
-                    check_quota_accounts(
-                        rt["base_url"],
-                        rt["token"],
-                        candidates,
-                        rt["user_agent"],
-                        rt["chatgpt_account_id"],
-                        rt["quota_workers"],
-                        rt["timeout"],
-                        rt["retries"],
-                        rt["weekly_quota_threshold"],
-                        rt["primary_quota_threshold"],
+                quota_results = []
+                if not _cancel_requested(cancel_event):
+                    quota_results = asyncio.run(
+                        check_quota_accounts(
+                            rt["base_url"],
+                            rt["token"],
+                            candidates,
+                            rt["user_agent"],
+                            rt["chatgpt_account_id"],
+                            rt["quota_workers"],
+                            rt["timeout"],
+                            rt["retries"],
+                            rt["weekly_quota_threshold"],
+                            rt["primary_quota_threshold"],
+                            cancel_event=cancel_event,
+                        )
                     )
-                )
 
                 invalid_401 = [r for r in probe_results if r.get("invalid_401")]
                 invalid_quota = [r for r in quota_results if r.get("invalid_quota")]
@@ -4176,14 +4437,16 @@ class EnhancedUI(_TK_BASE):
                     rt["output"],
                     rt["quota_output"],
                     active_target_meta,
+                    cancel_event,
                 )
             except Exception as e:
                 self.after(0, messagebox.showerror, "联合检测（401+额度）失败", str(e))
                 self.after(0, self.action_progress.set, "联合检测（401+额度）失败")
+                self.after(0, self._finish_batch_task, "联合检测（401+额度）失败", cancel_event)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _check_both_done(self, probe_results, quota_results, output_path, quota_output_path, active_target_meta=None):
+    def _check_both_done(self, probe_results, quota_results, output_path, quota_output_path, active_target_meta=None, cancel_event=None):
         probe_by_identity, _probe_conflicts = self._index_results_by_identity(probe_results)
         quota_by_identity, _quota_conflicts = self._index_results_by_identity(quota_results)
 
@@ -4229,16 +4492,18 @@ class EnhancedUI(_TK_BASE):
 
         snapshot = self._record_active_quota_snapshot("both")
 
+        cancelled_now = _cancel_requested(cancel_event)
         rebalance_summary = None
-        try:
-            rt = self._runtime()
-            rebalance_summary = self._rebalance_active_target_by_runtime(rt)
-        except Exception as e:
-            rebalance_summary = {"error": str(e)}
+        if not cancelled_now:
+            try:
+                rt = self._runtime()
+                rebalance_summary = self._rebalance_active_target_by_runtime(rt)
+            except Exception as e:
+                rebalance_summary = {"error": str(e)}
 
         self._load_accounts()
         self._apply_filter()
-        self.action_progress.set(f"联合检测（401+额度）完成：401={count_401} 额度耗尽={count_quota}")
+        cancelled = self._finish_batch_task(f"联合检测（401+额度）完成：401={count_401} 额度耗尽={count_quota}", cancel_event)
         msg_lines = [
             f"活跃目标门控：目标={target_active}，当前活跃={current_active_before}，可开启名额={available_slots_text}",
             f"401无效：{count_401}",
@@ -4273,8 +4538,6 @@ class EnhancedUI(_TK_BASE):
             self._start_close(names)
 
     def _start_close(self, names):
-        self.action_progress.set(f"正在关闭 {len(names)} 个账号...")
-
         try:
             rt = self._runtime()
         except Exception as e:
@@ -4282,23 +4545,29 @@ class EnhancedUI(_TK_BASE):
             self.action_progress.set("关闭失败")
             return
 
+        cancel_event = self._begin_batch_task("关闭账号")
+        if cancel_event is None:
+            return
+        self.action_progress.set(f"正在关闭 {len(names)} 个账号...")
+
         def worker():
             try:
                 result = asyncio.run(
-                    close_names(rt["base_url"], rt["token"], names, rt["close_workers"], rt["timeout"])
+                    close_names(rt["base_url"], rt["token"], names, rt["close_workers"], rt["timeout"], cancel_event=cancel_event)
                 )
-                self.after(0, self._close_done, result)
+                self.after(0, self._close_done, result, cancel_event)
             except Exception as e:
                 self.after(0, messagebox.showerror, "关闭失败", str(e))
                 self.after(0, self.action_progress.set, "关闭失败")
+                self.after(0, self._finish_batch_task, "关闭失败", cancel_event)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _close_done(self, results):
+    def _close_done(self, results, cancel_event=None):
         ok = [r for r in results if r.get("updated")]
         bad = [r for r in results if not r.get("updated")]
 
-        self.action_progress.set(f"关闭完成：成功={len(ok)} 失败={len(bad)}")
+        cancelled = self._finish_batch_task(f"关闭完成：成功={len(ok)} 失败={len(bad)}", cancel_event)
 
         if bad:
             msg = "部分关闭失败：\n" + "\n".join([f"- {r.get('name')}: {r.get('error')}" for r in bad[:15]])
@@ -4346,7 +4615,8 @@ class EnhancedUI(_TK_BASE):
             "确认恢复",
             (
                 f"将检测 {len(candidates)} 个已关闭账号的额度与状态（含401/其他错误）。\n"
-                "仅当状态正常且不满足“额度耗尽”条件时，才会自动开启这些账号。\n\n"
+                "仅当状态正常且不满足“额度耗尽”条件时，才会开启这些账号。\n"
+                "若开启后会超出活跃账号目标数，将在扫描完成后再次确认；取消时账号保持已关闭。\n\n"
                 "继续吗？"
             ),
         ):
@@ -4359,40 +4629,25 @@ class EnhancedUI(_TK_BASE):
         available_slots_text = "不限" if active_target_meta.get("unlimited") else str(available_slots_before)
         gap_rescan_summary = None
         if (not active_target_meta.get("unlimited")) and available_slots_before <= 0:
-            self.action_progress.set("当前差值=0，先复扫活跃账号以校准缺口...")
+            self.action_progress.set("当前差值=0，先复扫活跃账号以校准缺口；手动恢复不会静默跳过...")
             gap_rescan_summary = self._rescan_active_and_refresh_gap(rt, target_active, current_active_before)
             current_active_before = int(gap_rescan_summary.get("active_after") or current_active_before)
             available_slots_before = int(gap_rescan_summary.get("available_slots_after") or 0)
             available_slots_text = str(available_slots_before)
-            if available_slots_before <= 0:
-                extra_lines = [
-                    f"活跃复扫：扫描={int(gap_rescan_summary.get('scanned') or 0)}",
-                    f"发现401={int(gap_rescan_summary.get('invalid_401') or 0)}",
-                    f"发现额度耗尽={int(gap_rescan_summary.get('invalid_quota') or 0)}",
-                ]
-                if gap_rescan_summary.get("errors"):
-                    extra_lines.append("复扫异常: " + " | ".join((gap_rescan_summary.get("errors") or [])[:3]))
-                self.action_progress.set("恢复已关闭已跳过：复扫后可开启名额仍为0")
-                messagebox.showinfo(
-                    "恢复已关闭",
-                    (
-                        f"复扫后仍无可开启名额（目标={target_active}，当前活跃={current_active_before}）。\n"
-                        "本次不会从已关闭账号补齐。\n\n"
-                        + "\n".join(extra_lines)
-                    ),
-                )
-                return
 
-        scan_need_count = None if active_target_meta.get("unlimited") else max(0, available_slots_before)
-        scan_need_text = "全量扫描" if scan_need_count is None else f"按缺口扫描，最多补齐 {scan_need_count} 个"
+        scan_need_count = None
+        scan_need_text = "手动全量扫描；若可用账号会超出目标数，将在扫描后确认"
 
         self.action_progress.set(
             f"正在检测已关闭账号额度与状态... 候选={len(candidates)} | 目标={target_active} 当前活跃={current_active_before} 可开启名额={available_slots_text} | {scan_need_text}"
         )
+        cancel_event = self._begin_batch_task("恢复已关闭")
+        if cancel_event is None:
+            return
 
         def worker():
             try:
-                scan_summary = self._scan_for_recovery(rt, candidates, need_count=scan_need_count)
+                scan_summary = self._scan_for_recovery(rt, candidates, need_count=scan_need_count, cancel_event=cancel_event)
                 probe_by_identity = scan_summary.get("probe_by_name") or {}
                 quota_by_identity = scan_summary.get("quota_by_name") or {}
                 probe_results = list(probe_by_identity.values())
@@ -4401,7 +4656,29 @@ class EnhancedUI(_TK_BASE):
                 recoverable_names = list(scan_summary.get("recoverable") or [])
                 limit_meta = self._pick_names_with_active_target_limit(recoverable_names)
                 if isinstance(limit_meta, dict):
+                    available_slots = None if limit_meta.get("unlimited") else max(0, int(limit_meta.get("available_slots") or 0))
+                    would_exceed = (not limit_meta.get("unlimited")) and len(recoverable_names) > available_slots
+                    if would_exceed:
+                        self.after(
+                            0,
+                            self._confirm_manual_enable_after_closed_scan,
+                            candidates,
+                            probe_results,
+                            quota_results,
+                            dict(limit_meta),
+                            int(scan_summary.get("scanned") or 0),
+                            scan_need_count,
+                            list(scan_summary.get("errors") or []),
+                            gap_rescan_summary or {},
+                            cancel_event,
+                        )
+                        return
                     limit_meta = dict(limit_meta)
+                    limit_meta["selected"] = recoverable_names
+                    limit_meta["skipped"] = []
+                    limit_meta["manual_override"] = True
+                    limit_meta["manual_confirmed"] = False
+                    limit_meta["would_exceed_target"] = False
                     limit_meta["scanned"] = int(scan_summary.get("scanned") or 0)
                     limit_meta["recoverable_detected"] = len(recoverable_names)
                     limit_meta["scan_need_count"] = scan_need_count
@@ -4418,17 +4695,100 @@ class EnhancedUI(_TK_BASE):
                             names_to_enable,
                             rt["enable_workers"],
                             rt["timeout"],
+                            cancel_event=cancel_event,
                         )
                     )
 
-                self.after(0, self._recover_closed_done, candidates, probe_results, quota_results, enable_results, limit_meta)
+                self.after(0, self._recover_closed_done, candidates, probe_results, quota_results, enable_results, limit_meta, cancel_event)
             except Exception as e:
                 self.after(0, messagebox.showerror, "恢复失败", str(e))
                 self.after(0, self.action_progress.set, "恢复失败")
+                self.after(0, self._finish_batch_task, "恢复失败", cancel_event)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _recover_closed_done(self, candidate_raws, probe_results, quota_results, enable_results, limit_meta=None):
+    def _confirm_manual_enable_after_closed_scan(self, candidate_raws, probe_results, quota_results, limit_meta, scanned_count, scan_need_count, scan_errors, gap_rescan_summary, cancel_event=None):
+        recoverable_names = []
+        for n in list(limit_meta.get("selected") or []) + list(limit_meta.get("skipped") or []):
+            name = str(n or "").strip()
+            if name and name not in recoverable_names:
+                recoverable_names.append(name)
+
+        target_active = int(limit_meta.get("target_active") or 0)
+        current_active = int(limit_meta.get("current_active") or 0)
+        available_slots = max(0, int(limit_meta.get("available_slots") or 0))
+        overflow_count = max(0, len(recoverable_names) - available_slots)
+
+        ok = messagebox.askyesno(
+            "确认超出活跃目标",
+            (
+                f"本次检测到 {len(recoverable_names)} 个已关闭账号可恢复。\n"
+                f"当前活跃目标={target_active}，当前活跃={current_active}，可开启名额={available_slots}。\n"
+                f"如果继续，将超出目标数约 {overflow_count} 个账号。\n\n"
+                "是否仍继续开启这些可用账号？\n"
+                "选择“否”会保持它们为已关闭，不会自动转入备用池。"
+            ),
+        )
+
+        if not ok:
+            limit_meta = dict(limit_meta)
+            limit_meta["selected"] = []
+            limit_meta["skipped"] = recoverable_names
+            limit_meta["manual_cancelled"] = True
+            limit_meta["would_exceed_target"] = True
+            limit_meta["scanned"] = int(scanned_count or 0)
+            limit_meta["recoverable_detected"] = len(recoverable_names)
+            limit_meta["scan_need_count"] = scan_need_count
+            limit_meta["scan_errors"] = list(scan_errors or [])
+            limit_meta["gap_rescan_summary"] = gap_rescan_summary or {}
+            self._recover_closed_done(candidate_raws, probe_results, quota_results, [], limit_meta, cancel_event)
+            return
+
+        limit_meta = dict(limit_meta)
+        limit_meta["selected"] = recoverable_names
+        limit_meta["skipped"] = []
+        limit_meta["manual_override"] = True
+        limit_meta["manual_confirmed"] = True
+        limit_meta["would_exceed_target"] = True
+        limit_meta["scanned"] = int(scanned_count or 0)
+        limit_meta["recoverable_detected"] = len(recoverable_names)
+        limit_meta["scan_need_count"] = scan_need_count
+        limit_meta["scan_errors"] = list(scan_errors or [])
+        limit_meta["gap_rescan_summary"] = gap_rescan_summary or {}
+
+        try:
+            rt = self._runtime()
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            limit_meta["selected"] = []
+            limit_meta["skipped"] = recoverable_names
+            limit_meta["manual_cancelled"] = True
+            self._recover_closed_done(candidate_raws, probe_results, quota_results, [], limit_meta, cancel_event)
+            return
+
+        self.action_progress.set(f"正在开启 {len(recoverable_names)} 个已关闭账号...")
+
+        def worker():
+            try:
+                enable_results = asyncio.run(
+                    enable_names(
+                        rt["base_url"],
+                        rt["token"],
+                        recoverable_names,
+                        rt["enable_workers"],
+                        rt["timeout"],
+                        cancel_event=cancel_event,
+                    )
+                )
+                self.after(0, self._recover_closed_done, candidate_raws, probe_results, quota_results, enable_results, limit_meta, cancel_event)
+            except Exception as e:
+                self.after(0, messagebox.showerror, "恢复失败", str(e))
+                self.after(0, self.action_progress.set, "恢复失败")
+                self.after(0, self._finish_batch_task, "恢复失败", cancel_event)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _recover_closed_done(self, candidate_raws, probe_results, quota_results, enable_results, limit_meta=None, cancel_event=None):
         probe_by_identity, _probe_conflicts = self._index_results_by_identity(probe_results)
         quota_by_identity, _quota_conflicts = self._index_results_by_identity(quota_results)
 
@@ -4461,8 +4821,6 @@ class EnhancedUI(_TK_BASE):
         detect_errors = 0
         invalid_401_count = 0
         other_status_count = 0
-        overflow_to_standby_names = set()
-        standby_save_error = None
 
         for account in self.all_accounts:
             account_key = self._account_identity_key(account)
@@ -4537,11 +4895,8 @@ class EnhancedUI(_TK_BASE):
                 if e:
                     account["check_error"] = e.get("error") or account.get("check_error")
             elif recoverable_by_scan and (not selected_for_enable):
-                # 本轮已扫出可用，但因活跃目标数限制未开启：转入备用池，避免浪费扫描结果
-                if name:
-                    overflow_to_standby_names.add(name)
-                    self.standby_names.add(name)
-                account["standby"] = True
+                # 手动恢复中，可用但未开启（例如用户取消超目标确认）时保持已关闭，不自动转入备用池。
+                account["standby"] = False
                 account["disabled"] = True
                 if account.get("raw"):
                     account["raw"]["disabled"] = True
@@ -4549,25 +4904,15 @@ class EnhancedUI(_TK_BASE):
             elif p or q:
                 account["standby"] = False
 
-        if overflow_to_standby_names:
-            try:
-                self._save_standby_names_to_file()
-            except Exception as e:
-                standby_save_error = str(e)
-
         self._apply_filter()
-        self.action_progress.set(
-            f"恢复流程完成：开启成功={enabled_ok} 失败={enabled_fail} 转备用={len(overflow_to_standby_names)}"
+        cancelled = self._finish_batch_task(
+            f"恢复流程完成：开启成功={enabled_ok} 失败={enabled_fail} 保持已关闭={len(limit_data.get('skipped') or [])}",
+            cancel_event,
         )
 
         skipped_by_target = 0
         if isinstance(limit_meta, dict):
-            skipped_keys = limit_meta.get("skipped_keys") or set()
-            if skipped_keys:
-                skipped_by_target = len(skipped_keys)
-            else:
-                skipped_by_target = len(limit_meta.get("skipped") or [])
-        skipped_by_target = max(skipped_by_target, len(overflow_to_standby_names))
+            skipped_by_target = len(limit_meta.get("skipped") or [])
 
         recoverable_count = recoverable
         enabled_count = enabled_ok
@@ -4601,11 +4946,12 @@ class EnhancedUI(_TK_BASE):
         if detect_errors > 0:
             msg_lines.append(f"检测异常：{detect_errors}")
         if skipped_by_target > 0:
-            msg_lines.append(f"受全局活跃目标数限制未开启：{skipped_by_target}")
-        if overflow_to_standby_names:
-            msg_lines.append(f"本轮可用但超出目标的账号已转入备用池：{len(overflow_to_standby_names)}")
-        if standby_save_error:
-            msg_lines.append(f"备用池保存失败：{standby_save_error}")
+            if limit_data.get("manual_cancelled"):
+                msg_lines.append(f"用户取消超目标开启，账号保持已关闭：{skipped_by_target}")
+            else:
+                msg_lines.append(f"受全局活跃目标数限制未开启，账号保持已关闭：{skipped_by_target}")
+        if limit_data.get("manual_confirmed"):
+            msg_lines.append("本次为手动确认超出活跃目标后开启。")
 
         messagebox.showinfo("恢复已关闭结果", "\n".join(msg_lines))
 
@@ -4617,12 +4963,10 @@ class EnhancedUI(_TK_BASE):
             messagebox.showinfo("删除账号", "你没有选择任何账号。")
             return
 
-        if messagebox.askyesno("确认删除", f"确定要永久删除选中的 {len(names)} 个账号吗？\n\n此操作不可恢复。"):
+        if messagebox.askyesno("确认删除", f"确定要永久删除选中的 {len(names)} 个账号吗？\n\n此操作不可恢复；终止不会撤销已删除账号。"):
             self._start_delete(names)
 
     def _start_delete(self, names):
-        self.action_progress.set(f"正在删除 {len(names)} 个账号...")
-
         try:
             rt = self._runtime()
         except Exception as e:
@@ -4630,23 +4974,29 @@ class EnhancedUI(_TK_BASE):
             self.action_progress.set("删除失败")
             return
 
+        cancel_event = self._begin_batch_task("永久删除")
+        if cancel_event is None:
+            return
+        self.action_progress.set(f"正在删除 {len(names)} 个账号... 终止不会撤销已删除账号")
+
         def worker():
             try:
                 result = asyncio.run(
-                    delete_names(rt["base_url"], rt["token"], names, rt["delete_workers"], rt["timeout"])
+                    delete_names(rt["base_url"], rt["token"], names, rt["delete_workers"], rt["timeout"], cancel_event=cancel_event)
                 )
-                self.after(0, self._delete_done, result)
+                self.after(0, self._delete_done, result, cancel_event)
             except Exception as e:
                 self.after(0, messagebox.showerror, "删除失败", str(e))
                 self.after(0, self.action_progress.set, "删除失败")
+                self.after(0, self._finish_batch_task, "删除失败", cancel_event)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _delete_done(self, results):
+    def _delete_done(self, results, cancel_event=None):
         ok = [r for r in results if r.get("deleted")]
         bad = [r for r in results if not r.get("deleted")]
 
-        self.action_progress.set(f"删除完成：成功={len(ok)} 失败={len(bad)}")
+        cancelled = self._finish_batch_task(f"删除完成：成功={len(ok)} 失败={len(bad)}", cancel_event)
 
         if bad:
             msg = "部分删除失败：\n" + "\n".join([f"- {r.get('name')}: {r.get('error')}" for r in bad[:15]])

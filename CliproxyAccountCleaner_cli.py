@@ -56,6 +56,13 @@ LAST_PROGRESS_LINE_LENGTH = 0
 
 import re
 
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
 

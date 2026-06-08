@@ -1,6 +1,6 @@
 [project]
 name = "cliproxy-account-cleaner"
-version = "1.5.0"
+version = "1.5.1"
 description = "CLIProxy 管理端批量账号检测与处理工具"
 readme = "README.md"
 requires-python = ">=3.10"
