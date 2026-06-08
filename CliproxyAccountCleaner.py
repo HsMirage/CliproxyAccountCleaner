@@ -241,6 +241,108 @@ def build_quota_payload(auth_index, user_agent, chatgpt_account_id=None):
     return build_usage_payload(auth_index, user_agent, chatgpt_account_id)
 
 
+def _pick_first_val(d, *keys):
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        if d.get(k) is not None:
+            return d.get(k)
+    return None
+
+
+def _parse_percent(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        ss = str(v).strip().rstrip("%")
+        if ss == "":
+            return None
+        return float(ss)
+    except Exception:
+        return None
+
+
+def _parse_window(name, win):
+    if not isinstance(win, dict):
+        return None
+
+    reset_at = _pick_first_val(win, "reset_at", "resetAt")
+    if reset_at is None:
+        reset_after_seconds = _pick_first_val(win, "reset_after_seconds", "resetAfterSeconds")
+        if isinstance(reset_after_seconds, (int, float)):
+            try:
+                reset_at = int(time.time() + float(reset_after_seconds))
+            except Exception:
+                reset_at = None
+
+    return {
+        "key": name,
+        "name": _pick_first_val(win, "name", "id", "type") or name,
+        "used_percent": _parse_percent(_pick_first_val(win, "used_percent", "usedPercent", "used_percentage")),
+        "reset_at": reset_at,
+        "limit_window_seconds": _pick_first_val(
+            win,
+            "limit_window_seconds",
+            "limitWindowSeconds",
+            "window_seconds",
+            "windowSeconds",
+        ),
+        "remaining": _pick_first_val(win, "remaining"),
+        "limit_reached": _pick_first_val(win, "limit_reached", "limitReached"),
+    }
+
+
+def _extract_quota_windows(usage_data):
+    rate_limit = usage_data.get("rate_limit") or usage_data.get("rateLimit") or {}
+
+    primary_window = _parse_window(
+        "primary_window",
+        rate_limit.get("primary_window") or rate_limit.get("primaryWindow"),
+    )
+    secondary_window = _parse_window(
+        "secondary_window",
+        rate_limit.get("secondary_window") or rate_limit.get("secondaryWindow"),
+    )
+    individual_window = _parse_window(
+        "individual_window",
+        rate_limit.get("individual_window") or rate_limit.get("individualWindow"),
+    )
+
+    windows = [w for w in (primary_window, secondary_window, individual_window) if w is not None]
+    with_seconds = [w for w in windows if isinstance(w.get("limit_window_seconds"), (int, float))]
+
+    short_window = primary_window
+    weekly_window = individual_window or secondary_window
+
+    if short_window is None and with_seconds:
+        short_window = min(with_seconds, key=lambda x: x["limit_window_seconds"])
+
+    if weekly_window is None and with_seconds:
+        weekly_window = max(with_seconds, key=lambda x: x["limit_window_seconds"])
+
+    if short_window is not None and weekly_window is not None and short_window.get("key") == weekly_window.get("key"):
+        alternatives = [w for w in with_seconds if w.get("key") != short_window.get("key")]
+        if alternatives:
+            weekly_window = max(alternatives, key=lambda x: x["limit_window_seconds"])
+        elif isinstance(short_window.get("limit_window_seconds"), (int, float)) and short_window.get("limit_window_seconds") <= 6 * 3600:
+            weekly_window = None
+        else:
+            short_window = None
+
+    if (
+        short_window is None
+        and weekly_window is not None
+        and isinstance(weekly_window.get("limit_window_seconds"), (int, float))
+        and weekly_window.get("limit_window_seconds") <= 6 * 3600
+    ):
+        short_window = weekly_window
+        weekly_window = None
+
+    return rate_limit, windows, short_window, weekly_window
+
+
 async def _run_bounded(items, limit, make_coro):
     """Run async jobs with bounded in-flight tasks.
     Avoid creating one task per item when item count is huge.
@@ -497,106 +599,7 @@ async def check_quota_accounts(
                             body = data.get("body", "")
                             usage_data = as_json_obj(body)
 
-                            rate_limit = usage_data.get("rate_limit") or usage_data.get("rateLimit") or {}
-
-                            def pick_first_val(d, *keys):
-                                if not isinstance(d, dict):
-                                    return None
-                                for k in keys:
-                                    if d.get(k) is not None:
-                                        return d.get(k)
-                                return None
-
-                            def parse_percent(v):
-                                if v is None:
-                                    return None
-                                if isinstance(v, (int, float)):
-                                    return float(v)
-                                try:
-                                    s = str(v).strip().rstrip("%")
-                                    if s == "":
-                                        return None
-                                    return float(s)
-                                except Exception:
-                                    return None
-
-                            def parse_window(name, win):
-                                if not isinstance(win, dict):
-                                    return None
-                                return {
-                                    "name": name,
-                                    "used_percent": parse_percent(
-                                        pick_first_val(win, "used_percent", "usedPercent", "used_percentage")
-                                    ),
-                                    "reset_at": pick_first_val(win, "reset_at", "resetAt"),
-                                    "limit_window_seconds": pick_first_val(
-                                        win,
-                                        "limit_window_seconds",
-                                        "limitWindowSeconds",
-                                        "window_seconds",
-                                        "windowSeconds",
-                                    ),
-                                    "remaining": pick_first_val(win, "remaining"),
-                                    "limit_reached": pick_first_val(win, "limit_reached", "limitReached"),
-                                }
-
-                            windows = []
-                            for key in (
-                                "primary_window",
-                                "secondary_window",
-                                "individual_window",
-                                "primaryWindow",
-                                "secondaryWindow",
-                                "individualWindow",
-                            ):
-                                parsed = parse_window(key, rate_limit.get(key))
-                                if parsed is not None:
-                                    windows.append(parsed)
-
-                            weekly_window = None
-                            short_window = None
-
-                            for w in windows:
-                                lname = str(w.get("name") or "").lower()
-                                if weekly_window is None and "individual" in lname:
-                                    weekly_window = w
-                                if short_window is None and "secondary" in lname:
-                                    short_window = w
-
-                            with_seconds = [
-                                w for w in windows if isinstance(w.get("limit_window_seconds"), (int, float))
-                            ]
-                            if weekly_window is None and with_seconds:
-                                weekly_window = max(with_seconds, key=lambda x: x["limit_window_seconds"])
-
-                            if short_window is None and with_seconds:
-                                sorted_ws = sorted(with_seconds, key=lambda x: x["limit_window_seconds"])
-                                if weekly_window is None:
-                                    short_window = sorted_ws[0]
-                                else:
-                                    for w in sorted_ws:
-                                        if w.get("name") != weekly_window.get("name"):
-                                            short_window = w
-                                            break
-
-                            if weekly_window is None and windows:
-                                weekly_window = windows[0]
-
-                            if short_window is None and len(windows) > 1:
-                                for w in windows:
-                                    if weekly_window is None or w.get("name") != weekly_window.get("name"):
-                                        short_window = w
-                                        break
-
-                            # 单窗口场景：若窗口很短，按5小时窗口处理；否则按周窗口处理
-                            if (
-                                short_window is None
-                                and weekly_window is not None
-                                and isinstance(weekly_window.get("limit_window_seconds"), (int, float))
-                                and weekly_window.get("limit_window_seconds") <= 6 * 3600
-                            ):
-                                short_window = weekly_window
-                                weekly_window = None
+                            rate_limit, windows, short_window, weekly_window = _extract_quota_windows(usage_data)
 
                             weekly_used_percent = weekly_window.get("used_percent") if weekly_window else None
                             weekly_reset_at = weekly_window.get("reset_at") if weekly_window else None
@@ -609,49 +612,54 @@ async def check_quota_accounts(
                             result["primary_used_percent"] = short_used_percent
                             result["primary_reset_at"] = short_reset_at
 
-                            used_percent = None
-                            if weekly_used_percent is not None:
-                                used_percent = weekly_used_percent
-                                result["quota_source"] = "weekly"
-                            elif short_used_percent is not None:
-                                used_percent = short_used_percent
+                            if short_used_percent is not None:
+                                result["used_percent"] = short_used_percent
                                 result["quota_source"] = "5hour"
+                                result["invalid_quota"] = short_used_percent >= primary_quota_threshold
 
-                            if used_percent is not None:
-                                result["used_percent"] = used_percent
-                                if result["quota_source"] == "weekly":
-                                    result["invalid_quota"] = used_percent >= weekly_quota_threshold
-                                elif result["quota_source"] == "5hour":
-                                    result["invalid_quota"] = used_percent >= primary_quota_threshold
+                            if weekly_used_percent is not None and weekly_used_percent >= weekly_quota_threshold:
+                                result["used_percent"] = weekly_used_percent
+                                result["quota_source"] = "weekly"
+                                result["invalid_quota"] = True
+                            elif result.get("used_percent") is None and weekly_used_percent is not None:
+                                result["used_percent"] = weekly_used_percent
+                                result["quota_source"] = "weekly"
+                                result["invalid_quota"] = False
 
-                            # 无 used_percent 时，使用 remaining/limit_reached/allowed 兜底识别额度耗尽
-                            if result.get("used_percent") is None:
-                                remaining_zero = any(w.get("remaining") == 0 for w in windows)
-                                weekly_limit_reached = bool(weekly_window and weekly_window.get("limit_reached") is True)
-                                short_limit_reached = bool(short_window and short_window.get("limit_reached") is True)
-                                rate_limit_reached = pick_first_val(rate_limit, "limit_reached", "limitReached") is True
-                                rate_allowed = pick_first_val(rate_limit, "allowed")
+                            primary_limit_reached = bool(short_window and short_window.get("limit_reached") is True)
+                            weekly_limit_reached = bool(weekly_window and weekly_window.get("limit_reached") is True)
+                            remaining_zero = any(w.get("remaining") == 0 for w in windows)
+                            rate_limit_reached = _pick_first_val(rate_limit, "limit_reached", "limitReached") is True
+                            rate_allowed = _pick_first_val(rate_limit, "allowed")
+                            rate_limit_reached_type = usage_data.get("rate_limit_reached_type") or usage_data.get("rateLimitReachedType")
+                            additional_rate_limits = usage_data.get("additional_rate_limits") or usage_data.get("additionalRateLimits")
 
-                                if weekly_limit_reached:
-                                    result["used_percent"] = 100
-                                    result["invalid_quota"] = True
-                                    result["quota_source"] = "weekly_limit"
-                                elif short_limit_reached:
-                                    result["used_percent"] = 100
-                                    result["invalid_quota"] = True
-                                    result["quota_source"] = "5hour_limit"
-                                elif remaining_zero:
-                                    result["used_percent"] = 100
-                                    result["invalid_quota"] = True
-                                    result["quota_source"] = "remaining"
-                                elif rate_limit_reached or rate_allowed is False:
-                                    result["used_percent"] = 100
-                                    result["invalid_quota"] = True
-                                    result["quota_source"] = "rate_limit_flag"
-                                elif quota_marked_by_status:
-                                    result["used_percent"] = 100
-                                    result["invalid_quota"] = True
-                                    result["quota_source"] = "status_message"
+                            if weekly_limit_reached:
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "weekly_limit"
+                            elif primary_limit_reached:
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "5hour_limit"
+                            elif remaining_zero:
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "remaining"
+                            elif rate_limit_reached or rate_allowed is False:
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "rate_limit_flag"
+                                if result.get("primary_used_percent") is not None:
+                                    result["used_percent"] = result["primary_used_percent"]
+                                    result["quota_source"] = "5hour"
+                                elif result.get("individual_used_percent") is not None:
+                                    result["used_percent"] = result["individual_used_percent"]
+                                    result["quota_source"] = "weekly"
+                            elif rate_limit_reached_type or additional_rate_limits or quota_marked_by_status:
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "status_message"
 
                             # Set overall reset time (prefer weekly, fallback 5-hour)
                             result["reset_at"] = weekly_reset_at or short_reset_at or result.get("reset_at")
@@ -2099,6 +2107,12 @@ class EnhancedUI(_TK_BASE):
                 source_name = "剩余"
             elif quota_source == "status_message":
                 source_name = "状态"
+            elif quota_source == "weekly_limit":
+                source_name = "周限额"
+            elif quota_source == "5hour_limit":
+                source_name = "5小时限额"
+            elif quota_source == "rate_limit_flag":
+                source_name = "限流"
 
             weekly_percent = account.get("individual_used_percent")
             short_percent = account.get("primary_used_percent")

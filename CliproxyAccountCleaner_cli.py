@@ -456,9 +456,21 @@ def pick_first_val(d, *keys):
 def parse_window(name, window):
     if not isinstance(window, dict):
         return None
+
+    reset_at = pick_first_val(window, "reset_at", "resetAt")
+    if reset_at is None:
+        reset_after_seconds = pick_first_val(window, "reset_after_seconds", "resetAfterSeconds")
+        if isinstance(reset_after_seconds, (int, float)):
+            try:
+                reset_at = int(time.time() + float(reset_after_seconds))
+            except Exception:
+                reset_at = None
+
     return {
-        "name": name,
+        "key": name,
+        "name": pick_first_val(window, "name", "id", "type") or name,
         "used_percent": parse_percent(pick_first_val(window, "used_percent", "usedPercent", "used_percentage")),
+        "reset_at": reset_at,
         "limit_window_seconds": pick_first_val(
             window,
             "limit_window_seconds",
@@ -469,6 +481,55 @@ def parse_window(name, window):
         "remaining": pick_first_val(window, "remaining"),
         "limit_reached": pick_first_val(window, "limit_reached", "limitReached"),
     }
+
+
+def extract_quota_windows(usage_data):
+    rate_limit = usage_data.get("rate_limit") or usage_data.get("rateLimit") or {}
+
+    primary_window = parse_window(
+        "primary_window",
+        rate_limit.get("primary_window") or rate_limit.get("primaryWindow"),
+    )
+    secondary_window = parse_window(
+        "secondary_window",
+        rate_limit.get("secondary_window") or rate_limit.get("secondaryWindow"),
+    )
+    individual_window = parse_window(
+        "individual_window",
+        rate_limit.get("individual_window") or rate_limit.get("individualWindow"),
+    )
+
+    windows = [w for w in (primary_window, secondary_window, individual_window) if w is not None]
+    with_seconds = [w for w in windows if isinstance(w.get("limit_window_seconds"), (int, float))]
+
+    short_window = primary_window
+    weekly_window = individual_window or secondary_window
+
+    if short_window is None and with_seconds:
+        short_window = min(with_seconds, key=lambda x: x["limit_window_seconds"])
+
+    if weekly_window is None and with_seconds:
+        weekly_window = max(with_seconds, key=lambda x: x["limit_window_seconds"])
+
+    if short_window is not None and weekly_window is not None and short_window.get("key") == weekly_window.get("key"):
+        alternatives = [w for w in with_seconds if w.get("key") != short_window.get("key")]
+        if alternatives:
+            weekly_window = max(alternatives, key=lambda x: x["limit_window_seconds"])
+        elif isinstance(short_window.get("limit_window_seconds"), (int, float)) and short_window.get("limit_window_seconds") <= 6 * 3600:
+            weekly_window = None
+        else:
+            short_window = None
+
+    if (
+        short_window is None
+        and weekly_window is not None
+        and isinstance(weekly_window.get("limit_window_seconds"), (int, float))
+        and weekly_window.get("limit_window_seconds") <= 6 * 3600
+    ):
+        short_window = weekly_window
+        weekly_window = None
+
+    return rate_limit, windows, short_window, weekly_window
 
 
 def _contains_limit_error(value):
@@ -599,7 +660,19 @@ async def check_quota_batch(base_url, token, items, workers, timeout, target_typ
         async with sem:
             name = item.get("name", "")
             auth_index = item.get("auth_index", "")
-            result = {"name": name, "invalid_quota": False, "status_code": None, "used_percent": None, "error": None}
+            result = {
+                "name": name,
+                "invalid_quota": False,
+                "status_code": None,
+                "used_percent": None,
+                "primary_used_percent": None,
+                "primary_reset_at": None,
+                "individual_used_percent": None,
+                "individual_reset_at": None,
+                "reset_at": None,
+                "quota_source": None,
+                "error": None,
+            }
 
             if not auth_index:
                 result["error"] = "missing auth_index"
@@ -633,86 +706,75 @@ async def check_quota_batch(base_url, token, items, workers, timeout, target_typ
                         usage_data = safe_json_text(body) if isinstance(body, str) else body
 
                         if isinstance(usage_data, dict):
-                            rate_limit = usage_data.get("rate_limit") or usage_data.get("rateLimit") or {}
-
-                            windows = []
-                            for key in (
-                                "primary_window",
-                                "secondary_window",
-                                "individual_window",
-                                "primaryWindow",
-                                "secondaryWindow",
-                                "individualWindow",
-                            ):
-                                parsed = parse_window(key, rate_limit.get(key))
-                                if parsed is not None:
-                                    windows.append(parsed)
-
-                            weekly_window = None
-                            short_window = None
-
-                            for window in windows:
-                                lower_name = str(window.get("name") or "").lower()
-                                if weekly_window is None and "individual" in lower_name:
-                                    weekly_window = window
-                                if short_window is None and "secondary" in lower_name:
-                                    short_window = window
-
-                            with_seconds = [w for w in windows if isinstance(w.get("limit_window_seconds"), (int, float))]
-                            if weekly_window is None and with_seconds:
-                                weekly_window = max(with_seconds, key=lambda x: x["limit_window_seconds"])
-
-                            if short_window is None and with_seconds:
-                                sorted_windows = sorted(with_seconds, key=lambda x: x["limit_window_seconds"])
-                                if weekly_window is None:
-                                    short_window = sorted_windows[0]
-                                else:
-                                    for window in sorted_windows:
-                                        if window.get("name") != weekly_window.get("name"):
-                                            short_window = window
-                                            break
-
-                            if weekly_window is None and windows:
-                                weekly_window = windows[0]
-
-                            if short_window is None and len(windows) > 1:
-                                for window in windows:
-                                    if weekly_window is None or window.get("name") != weekly_window.get("name"):
-                                        short_window = window
-                                        break
-
-                            if (
-                                short_window is None
-                                and weekly_window is not None
-                                and isinstance(weekly_window.get("limit_window_seconds"), (int, float))
-                                and weekly_window.get("limit_window_seconds") <= 6 * 3600
-                            ):
-                                short_window = weekly_window
-                                weekly_window = None
+                            rate_limit, windows, short_window, weekly_window = extract_quota_windows(usage_data)
 
                             weekly_used_percent = weekly_window.get("used_percent") if weekly_window else None
                             short_used_percent = short_window.get("used_percent") if short_window else None
 
-                            if weekly_used_percent is not None:
-                                result["used_percent"] = weekly_used_percent
-                                result["invalid_quota"] = weekly_used_percent >= weekly_quota_threshold
-                            elif short_used_percent is not None:
+                            weekly_reset_at = weekly_window.get("reset_at") if weekly_window else None
+                            short_used_percent = short_window.get("used_percent") if short_window else None
+                            short_reset_at = short_window.get("reset_at") if short_window else None
+
+                            result["individual_used_percent"] = weekly_used_percent
+                            result["individual_reset_at"] = weekly_reset_at
+                            result["primary_used_percent"] = short_used_percent
+                            result["primary_reset_at"] = short_reset_at
+
+                            if short_used_percent is not None:
                                 result["used_percent"] = short_used_percent
+                                result["quota_source"] = "5hour"
                                 result["invalid_quota"] = short_used_percent >= primary_quota_threshold
 
-                            if not result["invalid_quota"]:
-                                remaining_zero = any(window.get("remaining") == 0 for window in windows)
-                                weekly_limit_reached = bool(weekly_window and weekly_window.get("limit_reached") is True)
-                                short_limit_reached = bool(short_window and short_window.get("limit_reached") is True)
-                                rate_limit_reached = pick_first_val(rate_limit, "limit_reached", "limitReached") is True
+                            if weekly_used_percent is not None and weekly_used_percent >= weekly_quota_threshold:
+                                result["used_percent"] = weekly_used_percent
+                                result["quota_source"] = "weekly"
+                                result["invalid_quota"] = True
+                            elif result.get("used_percent") is None and weekly_used_percent is not None:
+                                result["used_percent"] = weekly_used_percent
+                                result["quota_source"] = "weekly"
+                                result["invalid_quota"] = False
 
-                                if weekly_limit_reached or short_limit_reached or remaining_zero or rate_limit_reached:
-                                    result["used_percent"] = 100
-                                    result["invalid_quota"] = True
+                            primary_limit_reached = bool(short_window and short_window.get("limit_reached") is True)
+                            weekly_limit_reached = bool(weekly_window and weekly_window.get("limit_reached") is True)
+                            remaining_zero = any(window.get("remaining") == 0 for window in windows)
+                            rate_limit_reached = pick_first_val(rate_limit, "limit_reached", "limitReached") is True
+                            rate_allowed = pick_first_val(rate_limit, "allowed")
+                            rate_limit_reached_type = usage_data.get("rate_limit_reached_type") or usage_data.get("rateLimitReachedType")
+                            additional_rate_limits = usage_data.get("additional_rate_limits") or usage_data.get("additionalRateLimits")
+
+                            if weekly_limit_reached:
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "weekly_limit"
+                            elif primary_limit_reached:
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "5hour_limit"
+                            elif remaining_zero:
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "remaining"
+                            elif rate_limit_reached or rate_allowed is False:
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "rate_limit_flag"
+                                if result.get("primary_used_percent") is not None:
+                                    result["used_percent"] = result["primary_used_percent"]
+                                    result["quota_source"] = "5hour"
+                                elif result.get("individual_used_percent") is not None:
+                                    result["used_percent"] = result["individual_used_percent"]
+                                    result["quota_source"] = "weekly"
+                            elif rate_limit_reached_type or additional_rate_limits or _contains_limit_error(usage_data):
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "status_message"
+
+                            result["reset_at"] = weekly_reset_at or short_reset_at or result.get("reset_at")
 
                     elif _contains_limit_error(data) or _contains_limit_error(text):
                         result["used_percent"] = 100
                         result["invalid_quota"] = True
+                        result["quota_source"] = "status_message"
 
             except Exception as e:
                 if _contains_limit_error(str(e)):
@@ -1314,17 +1376,17 @@ def show_account_list(accounts, title, limit=50):
     print_separator()
     print(f"📝 {title}")
     print_separator()
-    
+
     if not accounts:
         print("(无)")
         return
-    
+
     for i, name in enumerate(accounts[:limit], 1):
         print(f"  {i}. {name}")
-    
+
     if len(accounts) > limit:
         print(f"\n  ... 还有 {len(accounts) - limit} 个账号未显示")
-    
+
     print(f"\n总计: {len(accounts)} 个账号")
 
 
@@ -1673,7 +1735,7 @@ if __name__ == "__main__":
         print(f"\n❌ 错误: {e}")
         import traceback
         traceback.print_exc()
-        
+
 
 
 

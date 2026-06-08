@@ -550,9 +550,15 @@ class WebState:
             parts.append(f"周: {a.get('individual_used_percent')}%")
         if a.get("primary_used_percent") is not None:
             parts.append(f"5小时: {a.get('primary_used_percent')}%")
-        rt = _rst(a.get("reset_at"))
-        if rt:
-            parts.append(f"重置: {rt}")
+        weekly_reset = _rst(a.get("individual_reset_at"))
+        primary_reset = _rst(a.get("primary_reset_at"))
+        reset_at = _rst(a.get("reset_at"))
+        if weekly_reset:
+            parts.append(f"周重置: {weekly_reset}")
+        if primary_reset:
+            parts.append(f"5小时重置: {primary_reset}")
+        if reset_at and reset_at not in {weekly_reset, primary_reset}:
+            parts.append(f"重置: {reset_at}")
         parts.append(f"来源: {src}")
         return " | ".join(parts)
 
@@ -573,10 +579,23 @@ class WebState:
                 k = self._bucket(a)
                 if k in sm:
                     sm[k] += 1
-                rows.append({"name": a.get("name") or "", "account": a.get("account") or "", "status_key": k,
-                              "status": self._bucket_text(k), "usage": self._usage(a),
-                              "error": (a.get("check_error") or "")[:240],
-                              "disabled": bool(a.get("disabled")), "standby": bool(a.get("standby"))})
+                rows.append({
+                    "name": a.get("name") or "",
+                    "account": a.get("account") or "",
+                    "status_key": k,
+                    "status": self._bucket_text(k),
+                    "usage": self._usage(a),
+                    "error": (a.get("check_error") or "")[:240],
+                    "disabled": bool(a.get("disabled")),
+                    "standby": bool(a.get("standby")),
+                    "used_percent": a.get("used_percent"),
+                    "primary_used_percent": a.get("primary_used_percent"),
+                    "primary_reset_at": a.get("primary_reset_at"),
+                    "individual_used_percent": a.get("individual_used_percent"),
+                    "individual_reset_at": a.get("individual_reset_at"),
+                    "reset_at": a.get("reset_at"),
+                    "quota_source": a.get("quota_source"),
+                })
             cfg = self._runtime(False)
             pub = {"base_url": cfg["base"], "token": cfg["token"], "target_type": cfg["target_type"],
                    "provider": cfg["provider"], "workers": cfg["workers"], "quota_workers": cfg["quota_workers"],
@@ -612,16 +631,28 @@ class WebState:
                         continue
                     o = old.get(n) or {}
                     st = str(raw.get("status") or o.get("status") or "unknown")
-                    out.append({"name": n, "account": raw.get("account") or raw.get("email") or "",
-                                "auth_index": raw.get("auth_index"), "provider": raw.get("provider") or "",
-                                "type": str(self.ns["get_item_type"](raw) or ""), "status": st,
-                                "disabled": bool(raw.get("disabled")),
-                                "stream_error_active": self.ns["_is_stream_error_active"](st, raw.get("status_message") or ""),
-                                "standby": n in self.standby,
-                                "invalid_401": bool(o.get("invalid_401")), "invalid_quota": bool(o.get("invalid_quota")),
-                                "used_percent": o.get("used_percent"), "primary_used_percent": o.get("primary_used_percent"),
-                                "individual_used_percent": o.get("individual_used_percent"), "reset_at": o.get("reset_at"),
-                                "quota_source": o.get("quota_source"), "check_error": o.get("check_error") or "", "raw": raw})
+                    out.append({
+                        "name": n,
+                        "account": raw.get("account") or raw.get("email") or "",
+                        "auth_index": raw.get("auth_index"),
+                        "provider": raw.get("provider") or "",
+                        "type": str(self.ns["get_item_type"](raw) or ""),
+                        "status": st,
+                        "disabled": bool(raw.get("disabled")),
+                        "stream_error_active": self.ns["_is_stream_error_active"](st, raw.get("status_message") or ""),
+                        "standby": n in self.standby,
+                        "invalid_401": bool(o.get("invalid_401")),
+                        "invalid_quota": bool(o.get("invalid_quota")),
+                        "used_percent": o.get("used_percent"),
+                        "primary_used_percent": o.get("primary_used_percent"),
+                        "primary_reset_at": o.get("primary_reset_at"),
+                        "individual_used_percent": o.get("individual_used_percent"),
+                        "individual_reset_at": o.get("individual_reset_at"),
+                        "reset_at": o.get("reset_at"),
+                        "quota_source": o.get("quota_source"),
+                        "check_error": o.get("check_error") or "",
+                        "raw": raw,
+                    })
                 self.rows = sorted(out, key=lambda x: (x.get("name") or "").lower())
             self._progress_tick("列表加载", True)
             self._progress_finish(f"刷新完成: 加载 {len(files)} 条")
@@ -786,7 +817,9 @@ class WebState:
                 a["invalid_quota"] = bool(r.get("invalid_quota"))
                 a["used_percent"] = r.get("used_percent")
                 a["primary_used_percent"] = r.get("primary_used_percent")
+                a["primary_reset_at"] = r.get("primary_reset_at")
                 a["individual_used_percent"] = r.get("individual_used_percent")
+                a["individual_reset_at"] = r.get("individual_reset_at")
                 a["reset_at"] = r.get("reset_at")
                 a["quota_source"] = r.get("quota_source")
                 if r.get("error"):
